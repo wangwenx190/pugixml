@@ -31,8 +31,11 @@
 
 // Include STL headers
 #ifndef PUGIXML_NO_STL
+#	include <concepts>
+#	include <cstddef>
 #	include <iterator>
 #	include <iosfwd>
+#	include <span>
 #	include <string>
 #endif
 
@@ -61,9 +64,19 @@
 #	endif
 #endif
 
-// If no API is defined, assume default
+// Define the API exported by pugixml
 #ifndef PUGIXML_API
-#	define PUGIXML_API
+#	if defined(_WIN32)
+#		if defined(PUGIXML_STATIC_DEFINE) || defined(PUGIXML_HEADER_ONLY)
+#			define PUGIXML_API
+#		elif defined(PUGIXML_EXPORTS)
+#			define PUGIXML_API __declspec(dllexport)
+#		else
+#			define PUGIXML_API __declspec(dllimport)
+#		endif
+#	else
+#		define PUGIXML_API __attribute__((visibility("default")))
+#	endif
 #endif
 
 // If no API for classes is defined, assume default
@@ -158,6 +171,12 @@ namespace pugi
 	typedef PUGIXML_CHAR char_t;
 
 #ifndef PUGIXML_NO_STL
+	namespace detail
+	{
+		template <typename T>
+		concept buffer_byte = std::same_as<T, std::byte> || std::same_as<T, const std::byte>;
+	}
+
 	// String type used for operations that work with STL string; depends on PUGIXML_WCHAR_MODE
 	typedef std::basic_string<PUGIXML_CHAR> string_t;
 #endif
@@ -698,6 +717,11 @@ namespace pugi
 		// Note: append_buffer allocates memory that has the lifetime of the owning document; removing the appended nodes does not immediately reclaim that memory.
 		xml_parse_result append_buffer(const void* contents, size_t size, unsigned int options = parse_default, xml_encoding encoding = encoding_auto);
 
+	#ifndef PUGIXML_NO_STL
+		template <detail::buffer_byte Byte, size_t Extent>
+		xml_parse_result append_buffer(std::span<Byte, Extent> contents, unsigned int options = parse_default, xml_encoding encoding = encoding_auto);
+	#endif
+
 		// Find attribute using predicate. Returns first attribute for which predicate returned true.
 		template <typename Predicate> xml_attribute find_attribute(Predicate pred) const
 		{
@@ -1098,7 +1122,8 @@ namespace pugi
 
 		status_append_invalid_root,	// Unable to append nodes since root type is not node_element or node_document (exclusive to xml_node::append_buffer)
 
-		status_no_document_element	// Parsing resulted in a document without element nodes
+		status_no_document_element,	// Parsing resulted in a document without element nodes
+		status_sax_aborted		// A SAX handler requested that parsing stop
 	};
 
 	// Parsing result
@@ -1123,10 +1148,171 @@ namespace pugi
 		const char* description() const;
 	};
 
+	// Sequential byte source for SAX parsing. Return 0 at EOF or read_error on failure.
+	// Short reads are allowed. A read must never return more than size bytes.
+	class PUGIXML_CLASS xml_reader
+	{
+	public:
+		enum { read_error = static_cast<size_t>(-1) };
+		virtual ~xml_reader();
+		virtual size_t read(void* data, size_t size) = 0;
+	};
+
+	struct xml_sax_attribute
+	{
+		const char_t* name;
+		const char_t* value;
+	};
+
+	// SAX-only options. Report element attributes and comments incrementally.
+	PUGIXML_INLINE_VAR const unsigned int parse_sax_stream_attributes = 0x8000;
+	PUGIXML_INLINE_VAR const unsigned int parse_sax_stream_comments = 0x10000;
+
+	// Strings and attribute arrays are valid only for the duration of the callback.
+	// Return false from any callback to stop parsing with status_sax_aborted.
+	class PUGIXML_CLASS xml_sax_handler
+	{
+	public:
+		virtual ~xml_sax_handler();
+		virtual bool start_element(const char_t* name, const xml_sax_attribute* attributes, size_t count);
+		virtual bool end_element(const char_t* name);
+		// type is node_pcdata, node_cdata, node_comment or node_doctype.
+		// A PCDATA run or CDATA section can be delivered in multiple calls.
+		virtual bool text(xml_node_type type, const char_t* value);
+		virtual bool processing_instruction(const char_t* name, const char_t* value);
+		virtual bool declaration(const char_t* name, const xml_sax_attribute* attributes, size_t count);
+
+		// With parse_sax_stream_attributes, start_element is called with no
+		// attributes. Each attribute then has a start, zero or more value
+		// chunks, and an end. end_start_element follows the closing > or />.
+		// XML declarations continue to use declaration().
+		virtual bool start_attribute(const char_t* name);
+		virtual bool attribute_value(const char_t* value);
+		virtual bool end_attribute();
+		virtual bool end_start_element();
+
+		// With parse_comments | parse_sax_stream_comments, this replaces
+		// text(node_comment, ...). The last chunk of a comment may be empty.
+		virtual bool comment_chunk(const char_t* value, bool last);
+	};
+
+	// SAX parse flags have the same lexical meaning as DOM parse flags. The DOM
+	// layout flags parse_embed_pcdata and parse_merge_pcdata have no effect.
+	PUGIXML_FUNCTION xml_parse_result xml_sax_parse(xml_reader& reader, xml_sax_handler& handler, unsigned int options = parse_default, xml_encoding encoding = encoding_auto);
+	PUGIXML_FUNCTION xml_parse_result xml_sax_parse_buffer(const void* data, size_t size, xml_sax_handler& handler, unsigned int options = parse_default, xml_encoding encoding = encoding_auto);
+	#ifndef PUGIXML_NO_STL
+	template <detail::buffer_byte Byte, size_t Extent>
+	inline xml_parse_result xml_sax_parse_buffer(std::span<Byte, Extent> data, xml_sax_handler& handler, unsigned int options = parse_default, xml_encoding encoding = encoding_auto)
+	{
+		return xml_sax_parse_buffer(data.data(), data.size_bytes(), handler, options, encoding);
+	}
+	#endif
+	PUGIXML_FUNCTION xml_parse_result xml_sax_parse_file(const char* path, xml_sax_handler& handler, unsigned int options = parse_default, xml_encoding encoding = encoding_auto);
+	PUGIXML_FUNCTION xml_parse_result xml_sax_parse_file(const wchar_t* path, xml_sax_handler& handler, unsigned int options = parse_default, xml_encoding encoding = encoding_auto);
+	#ifndef PUGIXML_NO_STL
+	PUGIXML_FUNCTION xml_parse_result xml_sax_parse(std::basic_istream<char>& stream, xml_sax_handler& handler, unsigned int options = parse_default, xml_encoding encoding = encoding_auto);
+	PUGIXML_FUNCTION xml_parse_result xml_sax_parse(std::basic_istream<wchar_t>& stream, xml_sax_handler& handler, unsigned int options = parse_default);
+	#endif
+
+	#ifdef PUGIXML_HAS_STRING_VIEW
+	struct xml_sax_attribute_view
+	{
+		string_view_t name;
+		string_view_t value;
+	};
+
+	// Views borrow storage until the callback returns. Returning false stops parsing.
+	class PUGIXML_CLASS xml_sax_view_handler
+	{
+	public:
+		virtual ~xml_sax_view_handler();
+		virtual bool start_element(string_view_t name, std::span<const xml_sax_attribute_view> attributes);
+		virtual bool end_element(string_view_t name);
+		virtual bool text(xml_node_type type, string_view_t value);
+		virtual bool processing_instruction(string_view_t name, string_view_t value);
+		virtual bool declaration(string_view_t name, std::span<const xml_sax_attribute_view> attributes);
+		virtual bool start_attribute(string_view_t name);
+		virtual bool attribute_value(string_view_t value);
+		virtual bool end_attribute();
+		virtual bool end_start_element();
+		virtual bool comment_chunk(string_view_t value, bool last);
+	};
+
+	PUGIXML_FUNCTION xml_parse_result xml_sax_parse(xml_reader& reader, xml_sax_view_handler& handler, unsigned int options = parse_default, xml_encoding encoding = encoding_auto);
+	PUGIXML_FUNCTION xml_parse_result xml_sax_parse_buffer(const void* data, size_t size, xml_sax_view_handler& handler, unsigned int options = parse_default, xml_encoding encoding = encoding_auto);
+	template <detail::buffer_byte Byte, size_t Extent>
+	inline xml_parse_result xml_sax_parse_buffer(std::span<Byte, Extent> data, xml_sax_view_handler& handler, unsigned int options = parse_default, xml_encoding encoding = encoding_auto)
+	{
+		return xml_sax_parse_buffer(data.data(), data.size_bytes(), handler, options, encoding);
+	}
+	PUGIXML_FUNCTION xml_parse_result xml_sax_parse_file(const char* path, xml_sax_view_handler& handler, unsigned int options = parse_default, xml_encoding encoding = encoding_auto);
+	PUGIXML_FUNCTION xml_parse_result xml_sax_parse_file(const wchar_t* path, xml_sax_view_handler& handler, unsigned int options = parse_default, xml_encoding encoding = encoding_auto);
+	PUGIXML_FUNCTION xml_parse_result xml_sax_parse(std::basic_istream<char>& stream, xml_sax_view_handler& handler, unsigned int options = parse_default, xml_encoding encoding = encoding_auto);
+	PUGIXML_FUNCTION xml_parse_result xml_sax_parse(std::basic_istream<wchar_t>& stream, xml_sax_view_handler& handler, unsigned int options = parse_default);
+
+	// Sequential parses can reuse dynamic storage up to the retention limit.
+	class PUGIXML_CLASS xml_sax_parser
+	{
+	public:
+		explicit xml_sax_parser(size_t max_retained_bytes = 128 * 1024);
+		~xml_sax_parser();
+		xml_sax_parser(const xml_sax_parser&) = delete;
+		xml_sax_parser& operator=(const xml_sax_parser&) = delete;
+
+		xml_parse_result parse(xml_reader& reader, xml_sax_view_handler& handler, unsigned int options = parse_default, xml_encoding encoding = encoding_auto);
+		xml_parse_result parse_buffer(const void* data, size_t size, xml_sax_view_handler& handler, unsigned int options = parse_default, xml_encoding encoding = encoding_auto);
+		template <detail::buffer_byte Byte, size_t Extent>
+		xml_parse_result parse_buffer(std::span<Byte, Extent> data, xml_sax_view_handler& handler, unsigned int options = parse_default, xml_encoding encoding = encoding_auto)
+		{
+			return parse_buffer(data.data(), data.size_bytes(), handler, options, encoding);
+		}
+
+	private:
+		void* _impl;
+	};
+	#endif
+
+	// Sequential raw XML output. The sink must outlive the writer. Supply a
+	// declaration explicitly if needed. Call finish() to flush balanced output.
+	// Methods return false on allocation failure or an invalid call sequence.
+	// Sink errors follow the contract of the supplied xml_writer. A sink
+	// exception propagates and invalidates the SAX writer.
+	class PUGIXML_CLASS xml_sax_writer
+	{
+	public:
+		explicit xml_sax_writer(xml_writer& writer, unsigned int flags = format_raw, xml_encoding encoding = encoding_auto);
+		~xml_sax_writer();
+
+		bool start_element(const char_t* name, const xml_sax_attribute* attributes = 0, size_t count = 0);
+		bool end_element();
+		bool text(xml_node_type type, const char_t* value);
+		bool processing_instruction(const char_t* name, const char_t* value);
+		bool declaration(const char_t* name, const xml_sax_attribute* attributes = 0, size_t count = 0);
+	#ifdef PUGIXML_HAS_STRING_VIEW
+		// Input views need no terminator. The writer owns open element names.
+		bool start_element(string_view_t name, std::span<const xml_sax_attribute_view> attributes = {});
+		bool text(xml_node_type type, string_view_t value);
+		bool processing_instruction(string_view_t name, string_view_t value);
+		bool declaration(string_view_t name, std::span<const xml_sax_attribute_view> attributes = {});
+	#endif
+		bool finish();
+		// Start another document after a successful finish, retaining the output
+		// buffer and at most max_retained_bytes of extra storage for open names.
+		bool reset(xml_writer& writer, unsigned int flags = format_raw, xml_encoding encoding = encoding_auto, size_t max_retained_bytes = 64 * 1024);
+
+	private:
+		xml_sax_writer(const xml_sax_writer&);
+		xml_sax_writer& operator=(const xml_sax_writer&);
+
+		void* _impl;
+	};
+
 	// Document class (DOM tree root)
 	class PUGIXML_CLASS xml_document: public xml_node
 	{
 	private:
+		friend class xml_document_parser;
+
 		char_t* _buffer;
 
 		char _memory[192];
@@ -1185,6 +1371,21 @@ namespace pugi
 		// You should allocate the buffer with pugixml allocation function; document will free the buffer when it is no longer needed (you can't use it anymore).
 		xml_parse_result load_buffer_inplace_own(void* contents, size_t size, unsigned int options = parse_default, xml_encoding encoding = encoding_auto);
 
+	#ifndef PUGIXML_NO_STL
+		// Byte spans follow the same copying and borrowing rules as the pointer overloads.
+		template <detail::buffer_byte Byte, size_t Extent>
+		xml_parse_result load_buffer(std::span<Byte, Extent> contents, unsigned int options = parse_default, xml_encoding encoding = encoding_auto)
+		{
+			return load_buffer(contents.data(), contents.size_bytes(), options, encoding);
+		}
+
+		template <size_t Extent>
+		xml_parse_result load_buffer_inplace(std::span<std::byte, Extent> contents, unsigned int options = parse_default, xml_encoding encoding = encoding_auto)
+		{
+			return load_buffer_inplace(contents.data(), contents.size_bytes(), options, encoding);
+		}
+	#endif
+
 		// Save XML document to writer (semantics is slightly different from xml_node::print, see documentation for details).
 		void save(xml_writer& writer, const char_t* indent = PUGIXML_TEXT("\t"), unsigned int flags = format_default, xml_encoding encoding = encoding_auto) const;
 
@@ -1201,6 +1402,31 @@ namespace pugi
 		// Get document element
 		xml_node document_element() const;
 	};
+
+	// Repeated loads can retain the native input buffer and one standard DOM
+	// page. The retention limit applies to storage reused across loads.
+	class PUGIXML_CLASS xml_document_parser
+	{
+	public:
+		explicit xml_document_parser(size_t max_retained_bytes = 128 * 1024);
+		const xml_document& document() const { return _document; }
+		void reset();
+
+		xml_parse_result load_buffer(const void* contents, size_t size, unsigned int options = parse_default, xml_encoding encoding = encoding_auto);
+	#ifndef PUGIXML_NO_STL
+		template <detail::buffer_byte Byte, size_t Extent>
+		xml_parse_result load_buffer(std::span<Byte, Extent> contents, unsigned int options = parse_default, xml_encoding encoding = encoding_auto)
+		{
+			return load_buffer(contents.data(), contents.size_bytes(), options, encoding);
+		}
+	#endif
+
+	private:
+		xml_document _document;
+		size_t _reuse_capacity;
+		size_t _max_retained_bytes;
+	};
+
 
 #ifndef PUGIXML_NO_XPATH
 	// XPath query return type
@@ -1547,6 +1773,14 @@ namespace pugi
 	// Get current memory management functions
 	allocation_function PUGIXML_FUNCTION get_memory_allocation_function();
 	deallocation_function PUGIXML_FUNCTION get_memory_deallocation_function();
+
+	#ifndef PUGIXML_NO_STL
+	template <detail::buffer_byte Byte, size_t Extent>
+	inline xml_parse_result xml_node::append_buffer(std::span<Byte, Extent> contents, unsigned int options, xml_encoding encoding)
+	{
+		return append_buffer(contents.data(), contents.size_bytes(), options, encoding);
+	}
+	#endif
 }
 
 #if !defined(PUGIXML_NO_STL) && (defined(_MSC_VER) || defined(__ICC))

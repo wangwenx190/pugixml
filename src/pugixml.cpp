@@ -20,9 +20,10 @@
 #include <assert.h>
 #include <limits.h>
 
-#ifdef PUGIXML_WCHAR_MODE
-#	include <wchar.h>
-#endif
+#include <wchar.h>
+
+#include <bit>
+#include <type_traits>
 
 #ifndef PUGIXML_NO_XPATH
 #	include <math.h>
@@ -41,6 +42,16 @@
 
 // For placement new
 #include <new>
+
+#if !defined(PUGIXML_WCHAR_MODE)
+#	if defined(__aarch64__) && defined(__ARM_NEON)
+#		include <arm_neon.h>
+#		define PUGI_IMPL_PCDATA_NEON
+#	elif defined(__SSE2__) || (defined(_M_X64) && !defined(_M_ARM64EC))
+#		include <emmintrin.h>
+#		define PUGI_IMPL_PCDATA_SSE2
+#	endif
+#endif
 
 // For load_file
 #if defined(__linux__) || defined(__APPLE__)
@@ -96,10 +107,13 @@
 // Inlining controls
 #if defined(_MSC_VER) && _MSC_VER >= 1300
 #	define PUGI_IMPL_NO_INLINE __declspec(noinline)
+#	define PUGI_IMPL_FORCE_INLINE __forceinline
 #elif defined(__GNUC__)
 #	define PUGI_IMPL_NO_INLINE __attribute__((noinline))
+#	define PUGI_IMPL_FORCE_INLINE inline __attribute__((always_inline))
 #else
 #	define PUGI_IMPL_NO_INLINE
+#	define PUGI_IMPL_FORCE_INLINE inline
 #endif
 
 // Unaligned memory access attribute
@@ -115,9 +129,6 @@
 #else
 #	define PUGI_IMPL_UNLIKELY(cond) (cond)
 #endif
-
-// Simple static assertion
-#define PUGI_IMPL_STATIC_ASSERT(cond) do { static const char condition_failed[(cond) ? 1 : -1] = {0}; (void)condition_failed[0]; } while (0)
 
 // Digital Mars C++ bug workaround for passing char loaded from memory via stack
 #ifdef __DMC__
@@ -290,18 +301,12 @@ PUGI_IMPL_NS_BEGIN
 		return lhs[count] == 0;
 	}
 
-	// Get length of wide string, even if CRT lacks wide character support
+	// Get length of a wide string in wchar_t units
 	PUGI_IMPL_FN size_t strlength_wide(const wchar_t* s)
 	{
 		assert(s);
 
-	#ifdef PUGIXML_WCHAR_MODE
 		return wcslen(s);
-	#else
-		const wchar_t* end = s;
-		while (*end) end++;
-		return static_cast<size_t>(end - s);
-	#endif
 	}
 PUGI_IMPL_NS_END
 
@@ -687,7 +692,7 @@ PUGI_IMPL_NS_BEGIN
 		{
 			static const size_t max_encoded_offset = (1 << 16) * xml_memory_block_alignment;
 
-			PUGI_IMPL_STATIC_ASSERT(xml_memory_page_size <= max_encoded_offset);
+			static_assert(xml_memory_page_size <= max_encoded_offset);
 
 			// allocate memory for string and header block
 			size_t size = sizeof(xml_memory_string_header) + length * sizeof(char_t);
@@ -802,7 +807,7 @@ PUGI_IMPL_NS_BEGIN
 	public:
 		compact_header(xml_memory_page* page, unsigned int flags)
 		{
-			PUGI_IMPL_STATIC_ASSERT(xml_memory_block_alignment == compact_alignment);
+			static_assert(xml_memory_block_alignment == compact_alignment);
 
 			ptrdiff_t offset = (reinterpret_cast<char*>(this) - reinterpret_cast<char*>(page->compact_page_marker));
 			assert(offset % compact_alignment == 0 && static_cast<uintptr_t>(offset) < 256 * compact_alignment);
@@ -1099,7 +1104,7 @@ namespace pugi
 	{
 		xml_attribute_struct(impl::xml_memory_page* page): header(page, 0), namevalue_base(0)
 		{
-			PUGI_IMPL_STATIC_ASSERT(sizeof(xml_attribute_struct) == 8);
+			static_assert(sizeof(xml_attribute_struct) == 8);
 		}
 
 		impl::compact_header header;
@@ -1117,7 +1122,7 @@ namespace pugi
 	{
 		xml_node_struct(impl::xml_memory_page* page, xml_node_type type): header(page, type), namevalue_base(0)
 		{
-			PUGI_IMPL_STATIC_ASSERT(sizeof(xml_node_struct) == 12);
+			static_assert(sizeof(xml_node_struct) == 12);
 		}
 
 		impl::compact_header header;
@@ -1478,7 +1483,12 @@ PUGI_IMPL_NS_BEGIN
 		attr->next_attribute = NULL;
 	}
 
-	PUGI_IMPL_FN_NO_INLINE xml_node_struct* append_new_node(xml_node_struct* node, xml_allocator& alloc, xml_node_type type = node_element)
+#ifdef PUGIXML_COMPACT
+	PUGI_IMPL_FN_NO_INLINE
+#else
+	inline
+#endif
+	xml_node_struct* append_new_node(xml_node_struct* node, xml_allocator& alloc, xml_node_type type = node_element)
 	{
 		if (!alloc.reserve()) return NULL;
 
@@ -1490,7 +1500,12 @@ PUGI_IMPL_NS_BEGIN
 		return child;
 	}
 
-	PUGI_IMPL_FN_NO_INLINE xml_attribute_struct* append_new_attribute(xml_node_struct* node, xml_allocator& alloc)
+#ifdef PUGIXML_COMPACT
+	PUGI_IMPL_FN_NO_INLINE
+#else
+	inline
+#endif
+	xml_attribute_struct* append_new_attribute(xml_node_struct* node, xml_allocator& alloc)
 	{
 		if (!alloc.reserve()) return NULL;
 
@@ -1518,16 +1533,6 @@ PUGI_IMPL_NS_END
 
 // Unicode utilities
 PUGI_IMPL_NS_BEGIN
-	inline uint16_t endian_swap(uint16_t value)
-	{
-		return static_cast<uint16_t>(((value & 0xff) << 8) | (value >> 8));
-	}
-
-	inline uint32_t endian_swap(uint32_t value)
-	{
-		return ((value & 0xff) << 24) | ((value & 0xff00) << 8) | ((value & 0xff0000) >> 8) | (value >> 24);
-	}
-
 	struct utf8_counter
 	{
 		typedef size_t value_type;
@@ -1774,7 +1779,7 @@ PUGI_IMPL_NS_BEGIN
 		{
 			while (size)
 			{
-				uint16_t lead = opt_swap::value ? endian_swap(*data) : *data;
+				uint16_t lead = opt_swap::value ? std::byteswap(*data) : *data;
 
 				// U+0000..U+D7FF
 				if (lead < 0xD800)
@@ -1793,7 +1798,7 @@ PUGI_IMPL_NS_BEGIN
 				// surrogate pair lead
 				else if (static_cast<unsigned int>(lead - 0xD800) < 0x400 && size >= 2)
 				{
-					uint16_t next = opt_swap::value ? endian_swap(data[1]) : data[1];
+					uint16_t next = opt_swap::value ? std::byteswap(data[1]) : data[1];
 
 					if (static_cast<unsigned int>(next - 0xDC00) < 0x400)
 					{
@@ -1826,7 +1831,7 @@ PUGI_IMPL_NS_BEGIN
 		{
 			while (size)
 			{
-				uint32_t lead = opt_swap::value ? endian_swap(*data) : *data;
+				uint32_t lead = opt_swap::value ? std::byteswap(*data) : *data;
 
 				// U+0000..U+FFFF
 				if (lead < 0x10000)
@@ -1902,7 +1907,7 @@ PUGI_IMPL_NS_BEGIN
 	PUGI_IMPL_FN void convert_wchar_endian_swap(wchar_t* result, const wchar_t* data, size_t length)
 	{
 		for (size_t i = 0; i < length; ++i)
-			result[i] = static_cast<wchar_t>(endian_swap(static_cast<wchar_selector<sizeof(wchar_t)>::type>(data[i])));
+			result[i] = static_cast<wchar_t>(std::byteswap(static_cast<wchar_selector<sizeof(wchar_t)>::type>(data[i])));
 	}
 #endif
 PUGI_IMPL_NS_END
@@ -1983,14 +1988,12 @@ PUGI_IMPL_NS_BEGIN
 
 	PUGI_IMPL_FN bool is_little_endian()
 	{
-		unsigned int ui = 1;
-
-		return *reinterpret_cast<unsigned char*>(&ui) == 1;
+		return std::endian::native == std::endian::little;
 	}
 
 	PUGI_IMPL_FN xml_encoding get_wchar_encoding()
 	{
-		PUGI_IMPL_STATIC_ASSERT(sizeof(wchar_t) == 2 || sizeof(wchar_t) == 4);
+		static_assert(sizeof(wchar_t) == 2 || sizeof(wchar_t) == 4);
 
 		if (sizeof(wchar_t) == 2)
 			return is_little_endian() ? encoding_utf16_le : encoding_utf16_be;
@@ -2059,6 +2062,10 @@ PUGI_IMPL_NS_BEGIN
 
 		uint8_t d0 = data[0], d1 = data[1], d2 = data[2], d3 = data[3];
 
+		// In the common UTF-8 case an opening tag cannot be a BOM, a
+		// wide-encoding prefix, or an XML declaration.
+		if (d0 == '<' && d1 != 0 && d1 != '?') return encoding_utf8;
+
 		// look for BOM in first few bytes
 		if (d0 == 0 && d1 == 0 && d2 == 0xfe && d3 == 0xff) return encoding_utf32_be;
 		if (d0 == 0xff && d1 == 0xfe && d2 == 0 && d3 == 0) return encoding_utf32_le;
@@ -2125,7 +2132,7 @@ PUGI_IMPL_NS_BEGIN
 		size_t length = size / sizeof(char_t);
 		assert(contents || length == 0);
 
-		if (is_mutable)
+		if (is_mutable && reinterpret_cast<uintptr_t>(contents) % alignof(char_t) == 0)
 		{
 			out_buffer = static_cast<char_t*>(const_cast<void*>(contents));
 			out_length = length;
@@ -2156,14 +2163,13 @@ PUGI_IMPL_NS_BEGIN
 
 	PUGI_IMPL_FN bool convert_buffer_endian_swap(char_t*& out_buffer, size_t& out_length, const void* contents, size_t size, bool is_mutable)
 	{
-		const char_t* data = static_cast<const char_t*>(contents);
 		size_t length = size / sizeof(char_t);
+		bool aligned = reinterpret_cast<uintptr_t>(contents) % alignof(char_t) == 0;
 
-		if (is_mutable)
+		if (is_mutable && aligned)
 		{
-			char_t* buffer = const_cast<char_t*>(data);
-
-			convert_wchar_endian_swap(buffer, data, length);
+			char_t* buffer = static_cast<char_t*>(const_cast<void*>(contents));
+			convert_wchar_endian_swap(buffer, buffer, length);
 
 			out_buffer = buffer;
 			out_length = length;
@@ -2173,7 +2179,14 @@ PUGI_IMPL_NS_BEGIN
 			char_t* buffer = static_cast<char_t*>(xml_memory::allocate((length + 1) * sizeof(char_t)));
 			if (!buffer) return false;
 
-			convert_wchar_endian_swap(buffer, data, length);
+			// Byte buffers may begin at an address unsuitable for wchar_t loads.
+			if (aligned)
+				convert_wchar_endian_swap(buffer, static_cast<const char_t*>(contents), length);
+			else
+			{
+				memcpy(buffer, contents, length * sizeof(char_t));
+				convert_wchar_endian_swap(buffer, buffer, length);
+			}
 			buffer[length] = 0;
 
 			out_buffer = buffer;
@@ -2528,7 +2541,33 @@ PUGI_IMPL_NS_BEGIN
 		}
 	};
 
-	PUGI_IMPL_FN char_t* strconv_escape(char_t* s, gap& g)
+	struct sax_view_gap: gap
+	{
+		void push(char_t*& s, size_t count)
+		{
+			if (end)
+			{
+				assert(s >= end);
+				size_t length = static_cast<size_t>(s - end);
+				char_t* target = end - size;
+				if (length == 1)
+					target[0] = end[0];
+				else if (length == 2)
+				{
+					target[0] = end[0];
+					target[1] = end[1];
+				}
+				else if (length)
+					memmove(target, end, length * sizeof(char_t));
+			}
+
+			s += count;
+			end = s;
+			size += count;
+		}
+	};
+
+	template <typename Gap> PUGI_IMPL_FN char_t* strconv_escape(char_t* s, Gap& g)
 	{
 		char_t* stre = s + 1;
 
@@ -2737,19 +2776,101 @@ PUGI_IMPL_NS_BEGIN
 		}
 	}
 
-	typedef char_t* (*strconv_pcdata_t)(char_t*);
+#if defined(PUGI_IMPL_PCDATA_NEON) || defined(PUGI_IMPL_PCDATA_SSE2)
+	template <bool output, typename Char> PUGI_IMPL_FN Char* scan_pcdata_blocks(Char* s, const char_t* limit)
+	{
+		// Each vector load fits within the input. Leave a matching block for
+		// the scalar scanner, which locates the exact character to handle.
+		while (limit - s >= 16)
+		{
+		#ifdef PUGI_IMPL_PCDATA_NEON
+			uint8x16_t bytes = vld1q_u8(reinterpret_cast<const uint8_t*>(s));
+			uint8x16_t specials = vorrq_u8(vceqq_u8(bytes, vdupq_n_u8('<')), vceqq_u8(bytes, vdupq_n_u8('&')));
+
+			if (output)
+			{
+				uint8x16_t spaces = vorrq_u8(vceqq_u8(bytes, vdupq_n_u8('\t')), vceqq_u8(bytes, vdupq_n_u8('\n')));
+				spaces = vorrq_u8(spaces, vceqq_u8(bytes, vdupq_n_u8('\r')));
+				specials = vorrq_u8(specials, vceqq_u8(bytes, vdupq_n_u8('>')));
+				specials = vorrq_u8(specials, vbicq_u8(vcltq_u8(bytes, vdupq_n_u8(32)), spaces));
+			}
+			else
+			{
+				specials = vorrq_u8(specials, vceqq_u8(bytes, vdupq_n_u8('\r')));
+				specials = vorrq_u8(specials, vceqq_u8(bytes, vdupq_n_u8(0)));
+			}
+			if (vmaxvq_u8(specials)) break;
+		#else
+			__m128i bytes = _mm_loadu_si128(reinterpret_cast<const __m128i*>(s));
+			__m128i specials = _mm_or_si128(_mm_cmpeq_epi8(bytes, _mm_set1_epi8('<')), _mm_cmpeq_epi8(bytes, _mm_set1_epi8('&')));
+
+			if (output)
+			{
+				__m128i spaces = _mm_or_si128(_mm_cmpeq_epi8(bytes, _mm_set1_epi8('\t')), _mm_cmpeq_epi8(bytes, _mm_set1_epi8('\n')));
+				spaces = _mm_or_si128(spaces, _mm_cmpeq_epi8(bytes, _mm_set1_epi8('\r')));
+				__m128i controls = _mm_cmpeq_epi8(_mm_and_si128(bytes, _mm_set1_epi8(-32)), _mm_setzero_si128());
+				specials = _mm_or_si128(specials, _mm_cmpeq_epi8(bytes, _mm_set1_epi8('>')));
+				specials = _mm_or_si128(specials, _mm_andnot_si128(spaces, controls));
+			}
+			else
+			{
+				specials = _mm_or_si128(specials, _mm_cmpeq_epi8(bytes, _mm_set1_epi8('\r')));
+				specials = _mm_or_si128(specials, _mm_cmpeq_epi8(bytes, _mm_setzero_si128()));
+			}
+			if (_mm_movemask_epi8(specials)) break;
+		#endif
+
+			s += 16;
+		}
+
+		return s;
+	}
+#endif
+
+	PUGI_IMPL_FN char_t* scan_pcdata(char_t* s, const char_t* limit)
+	{
+	#if defined(PUGI_IMPL_PCDATA_NEON) || defined(PUGI_IMPL_PCDATA_SSE2)
+		// Short text and closely spaced references usually end in the probe.
+		for (unsigned int i = 0; i < 16; ++i, ++s)
+			if (PUGI_IMPL_IS_CHARTYPE(*s, ct_parse_pcdata)) return s;
+
+		s = scan_pcdata_blocks<false>(s, limit);
+	#else
+		(void)limit;
+	#endif
+
+		PUGI_IMPL_SCANWHILE_UNROLL(!PUGI_IMPL_IS_CHARTYPE(ss, ct_parse_pcdata));
+		return s;
+	}
+
+	typedef char_t* (*strconv_pcdata_t)(char_t*, const char_t*);
+	typedef void (*strconv_sax_pcdata_t)(char_t*, const char_t*, char_t*&);
 
 	template <typename opt_trim, typename opt_eol, typename opt_escape> struct strconv_pcdata_impl
 	{
-		static char_t* parse(char_t* s)
+		template <bool sax, typename Gap = gap> static char_t* parse_impl(char_t* s, const char_t* limit, char_t** decoded_end)
 		{
-			gap g;
+			Gap g;
 
 			char_t* begin = s;
 
 			while (true)
 			{
-				PUGI_IMPL_SCANWHILE_UNROLL(!PUGI_IMPL_IS_CHARTYPE(ss, ct_parse_pcdata));
+			#if defined(PUGI_IMPL_PCDATA_NEON) || defined(PUGI_IMPL_PCDATA_SSE2)
+				if constexpr (sax && opt_escape::value)
+				{
+					// Adjacent references often have at most one character between them.
+					constexpr unsigned int probe_size = 2;
+					unsigned int i = 0;
+					for (; i < probe_size; ++i, ++s)
+						if (PUGI_IMPL_IS_CHARTYPE(*s, ct_parse_pcdata)) break;
+					if (i == probe_size) s = scan_pcdata(s, limit);
+				}
+				else
+			#endif
+				{
+					s = scan_pcdata(s, limit);
+				}
 
 				if (*s == '<') // PCDATA ends here
 				{
@@ -2760,6 +2881,7 @@ PUGI_IMPL_NS_BEGIN
 							--end;
 
 					*end = 0;
+					if (sax) *decoded_end = end;
 
 					return s + 1;
 				}
@@ -2782,30 +2904,53 @@ PUGI_IMPL_NS_BEGIN
 							--end;
 
 					*end = 0;
+					if (sax) *decoded_end = end;
 
 					return s;
 				}
 				else ++s;
 			}
 		}
+		static char_t* parse(char_t* s, const char_t* limit) { return parse_impl<false>(s, limit, NULL); }
 	};
 
-	PUGI_IMPL_FN strconv_pcdata_t get_strconv_pcdata(unsigned int optmask)
+	template <typename opt_trim, typename opt_eol, typename opt_escape> struct strconv_sax_pcdata_impl
 	{
-		PUGI_IMPL_STATIC_ASSERT(parse_escapes == 0x10 && parse_eol == 0x20 && parse_trim_pcdata == 0x0800);
+		static void parse(char_t* s, const char_t* limit, char_t*& end)
+		{
+			strconv_pcdata_impl<opt_trim, opt_eol, opt_escape>::template parse_impl<true>(s, limit, &end);
+		}
+	};
+
+	template <typename opt_trim, typename opt_eol, typename opt_escape> struct strconv_sax_view_pcdata_impl
+	{
+		static void parse(char_t* s, const char_t* limit, char_t*& end)
+		{
+			strconv_pcdata_impl<opt_trim, opt_eol, opt_escape>::template parse_impl<true, sax_view_gap>(s, limit, &end);
+		}
+	};
+
+	template <typename F, template <typename, typename, typename> class Parser> PUGI_IMPL_FN F get_strconv_pcdata_impl(unsigned int optmask)
+	{
+		static_assert(parse_escapes == 0x10 && parse_eol == 0x20 && parse_trim_pcdata == 0x0800);
 
 		switch (((optmask >> 4) & 3) | ((optmask >> 9) & 4)) // get bitmask for flags (trim eol escapes); this simultaneously checks 3 options from assertion above
 		{
-		case 0: return strconv_pcdata_impl<opt_false, opt_false, opt_false>::parse;
-		case 1: return strconv_pcdata_impl<opt_false, opt_false, opt_true>::parse;
-		case 2: return strconv_pcdata_impl<opt_false, opt_true, opt_false>::parse;
-		case 3: return strconv_pcdata_impl<opt_false, opt_true, opt_true>::parse;
-		case 4: return strconv_pcdata_impl<opt_true, opt_false, opt_false>::parse;
-		case 5: return strconv_pcdata_impl<opt_true, opt_false, opt_true>::parse;
-		case 6: return strconv_pcdata_impl<opt_true, opt_true, opt_false>::parse;
-		case 7: return strconv_pcdata_impl<opt_true, opt_true, opt_true>::parse;
+		case 0: return Parser<opt_false, opt_false, opt_false>::parse;
+		case 1: return Parser<opt_false, opt_false, opt_true>::parse;
+		case 2: return Parser<opt_false, opt_true, opt_false>::parse;
+		case 3: return Parser<opt_false, opt_true, opt_true>::parse;
+		case 4: return Parser<opt_true, opt_false, opt_false>::parse;
+		case 5: return Parser<opt_true, opt_false, opt_true>::parse;
+		case 6: return Parser<opt_true, opt_true, opt_false>::parse;
+		case 7: return Parser<opt_true, opt_true, opt_true>::parse;
 		default: assert(false); return NULL; // unreachable
 		}
+	}
+
+	PUGI_IMPL_FN strconv_pcdata_t get_strconv_pcdata(unsigned int optmask)
+	{
+		return get_strconv_pcdata_impl<strconv_pcdata_t, strconv_pcdata_impl>(optmask);
 	}
 
 	typedef char_t* (*strconv_attribute_t)(char_t*, char_t);
@@ -2961,7 +3106,7 @@ PUGI_IMPL_NS_BEGIN
 
 	PUGI_IMPL_FN strconv_attribute_t get_strconv_attribute(unsigned int optmask)
 	{
-		PUGI_IMPL_STATIC_ASSERT(parse_escapes == 0x10 && parse_eol == 0x20 && parse_wconv_attribute == 0x40 && parse_wnorm_attribute == 0x80);
+		static_assert(parse_escapes == 0x10 && parse_eol == 0x20 && parse_wconv_attribute == 0x40 && parse_wnorm_attribute == 0x80);
 
 		switch ((optmask >> 4) & 15) // get bitmask for flags (wnorm wconv eol escapes); this simultaneously checks 4 options from assertion above
 		{
@@ -3324,8 +3469,9 @@ PUGI_IMPL_NS_BEGIN
 			return s;
 		}
 
-		char_t* parse_tree(char_t* s, xml_node_struct* root, unsigned int optmsk, char_t endch)
+		template <bool default_options> char_t* parse_tree(char_t* s, const char_t* limit, xml_node_struct* root, unsigned int options, char_t endch)
 		{
+			const unsigned int optmsk = default_options ? parse_default : options;
 			strconv_attribute_t strconv_attribute = get_strconv_attribute(optmsk);
 			strconv_pcdata_t strconv_pcdata = get_strconv_pcdata(optmsk);
 
@@ -3389,7 +3535,13 @@ PUGI_IMPL_NS_BEGIN
 											++s; // Step over the quote.
 											a->value = s; // Save the offset.
 
-											s = strconv_attribute(s, ch);
+											if constexpr (default_options)
+											{
+												PUGI_IMPL_SCANWHILE_UNROLL(!PUGI_IMPL_IS_CHARTYPE(ss, ct_parse_attr_ws));
+												if (*s == ch) *s++ = 0;
+												else s = strconv_attribute(s, ch);
+											}
+											else s = strconv_attribute(s, ch);
 
 											if (!s) PUGI_IMPL_THROW_ERROR(status_bad_attribute, a->value);
 
@@ -3460,12 +3612,13 @@ PUGI_IMPL_NS_BEGIN
 						char_t* name = cursor->name;
 						if (!name) PUGI_IMPL_THROW_ERROR(status_end_element_mismatch, mark);
 
-						while (PUGI_IMPL_IS_CHARTYPE(*s, ct_symbol))
+						while (*name && *s == *name)
 						{
-							if (*s++ != *name++) PUGI_IMPL_THROW_ERROR(status_end_element_mismatch, mark);
+							++s;
+							++name;
 						}
 
-						if (*name)
+						if (*name || (*s != '>' && PUGI_IMPL_IS_CHARTYPE(*s, ct_symbol)))
 						{
 							if (*s == 0 && name[0] == endch && name[1] == 0) PUGI_IMPL_THROW_ERROR(status_bad_end_element, s);
 							else PUGI_IMPL_THROW_ERROR(status_end_element_mismatch, mark);
@@ -3473,17 +3626,12 @@ PUGI_IMPL_NS_BEGIN
 
 						PUGI_IMPL_POPNODE(); // Pop.
 
-						PUGI_IMPL_SKIPWS();
-
-						if (*s == 0)
+						if (*s != '>')
 						{
-							if (endch != '>') PUGI_IMPL_THROW_ERROR(status_bad_end_element, s);
+							PUGI_IMPL_SKIPWS();
+							if (!PUGI_IMPL_ENDSWITH(*s, '>')) PUGI_IMPL_THROW_ERROR(status_bad_end_element, s);
 						}
-						else
-						{
-							if (*s != '>') PUGI_IMPL_THROW_ERROR(status_bad_end_element, s);
-							++s;
-						}
+						s += (*s == '>');
 					}
 					else if (*s == '?') // '<?...'
 					{
@@ -3529,7 +3677,7 @@ PUGI_IMPL_NS_BEGIN
 					{
 						char_t* parsed_pcdata = s;
 
-						s = strconv_pcdata(s);
+						s = strconv_pcdata(s, limit);
 
 						if (PUGI_IMPL_OPTSET(parse_embed_pcdata) && cursor->parent && !cursor->first_child && !cursor->value)
 						{
@@ -3625,7 +3773,10 @@ PUGI_IMPL_NS_BEGIN
 			char_t* buffer_data = parse_skip_bom(buffer);
 
 			// perform actual parsing
-			parser.parse_tree(buffer_data, root, optmsk, endch);
+			if (optmsk == parse_default)
+				parser.parse_tree<true>(buffer_data, buffer + length - 1, root, optmsk, endch);
+			else
+				parser.parse_tree<false>(buffer_data, buffer + length - 1, root, optmsk, endch);
 
 			xml_parse_result result = make_parse_result(parser.error_status, parser.error_offset ? parser.error_offset - buffer : 0);
 			assert(result.offset >= 0 && static_cast<size_t>(result.offset) <= length);
@@ -3683,7 +3834,7 @@ PUGI_IMPL_NS_BEGIN
 
 	template <typename D, typename T> PUGI_IMPL_FN size_t convert_buffer_output_generic(typename T::value_type dest, const char_t* data, size_t length, D, T)
 	{
-		PUGI_IMPL_STATIC_ASSERT(sizeof(char_t) == sizeof(typename D::type));
+		static_assert(sizeof(char_t) == sizeof(typename D::type));
 
 		typename T::value_type end = D::process(reinterpret_cast<const typename D::type*>(data), length, dest, T());
 
@@ -3692,14 +3843,14 @@ PUGI_IMPL_NS_BEGIN
 
 	template <typename D, typename T> PUGI_IMPL_FN size_t convert_buffer_output_generic(typename T::value_type dest, const char_t* data, size_t length, D, T, bool opt_swap)
 	{
-		PUGI_IMPL_STATIC_ASSERT(sizeof(char_t) == sizeof(typename D::type));
+		static_assert(sizeof(char_t) == sizeof(typename D::type));
 
 		typename T::value_type end = D::process(reinterpret_cast<const typename D::type*>(data), length, dest, T());
 
 		if (opt_swap)
 		{
 			for (typename T::value_type i = dest; i != end; ++i)
-				*i = endian_swap(*i);
+				*i = std::byteswap(*i);
 		}
 
 		return static_cast<size_t>(end - dest) * sizeof(*dest);
@@ -3792,6 +3943,41 @@ PUGI_IMPL_NS_BEGIN
 	}
 #endif
 
+	// Fixed-size copies cover the ends of a short name without reading past it.
+	PUGI_IMPL_FORCE_INLINE void copy_tag_name(char_t* dest, const char_t* name, size_t count)
+	{
+		if (count > 64)
+			memcpy(dest, name, count * sizeof(char_t));
+		else if (count > 32)
+		{
+			memcpy(dest, name, 32 * sizeof(char_t));
+			memcpy(dest + count - 32, name + count - 32, 32 * sizeof(char_t));
+		}
+		else if (count > 16)
+		{
+			memcpy(dest, name, 16 * sizeof(char_t));
+			memcpy(dest + count - 16, name + count - 16, 16 * sizeof(char_t));
+		}
+		else if (count >= 8)
+		{
+			memcpy(dest, name, 8 * sizeof(char_t));
+			memcpy(dest + count - 8, name + count - 8, 8 * sizeof(char_t));
+		}
+		else if (count >= 4)
+		{
+			memcpy(dest, name, 4 * sizeof(char_t));
+			memcpy(dest + count - 4, name + count - 4, 4 * sizeof(char_t));
+		}
+		else if (count >= 2)
+		{
+			dest[0] = name[0];
+			dest[count - 1] = name[count - 1];
+			dest[1] = name[1];
+		}
+		else if (count)
+			dest[0] = name[0];
+	}
+
 	class xml_buffered_writer
 	{
 		xml_buffered_writer(const xml_buffered_writer&);
@@ -3800,7 +3986,7 @@ PUGI_IMPL_NS_BEGIN
 	public:
 		xml_buffered_writer(xml_writer& writer_, xml_encoding user_encoding): writer(writer_), bufsize(0), encoding(get_write_encoding(user_encoding))
 		{
-			PUGI_IMPL_STATIC_ASSERT(bufcapacity >= 8);
+			static_assert(bufcapacity >= 8);
 		}
 
 		size_t flush()
@@ -3907,6 +4093,100 @@ PUGI_IMPL_NS_BEGIN
 			}
 		}
 
+		void write_attribute_start(const char_t* name, char_t quote)
+		{
+			size_t offset = bufsize;
+			if (offset < bufcapacity - 2)
+			{
+				buffer[offset++] = ' ';
+				const char_t* rest = name;
+				while (*rest && offset < bufcapacity - 2)
+					buffer[offset++] = *rest++;
+				if (!*rest)
+				{
+					buffer[offset++] = '=';
+					buffer[offset++] = quote;
+					bufsize = offset;
+					return;
+				}
+			}
+			write(' ');
+			write_string(name);
+			write('=', quote);
+		}
+
+	#ifdef PUGIXML_HAS_STRING_VIEW
+		void write_attribute_start(string_view_t name, char_t quote)
+		{
+			size_t offset = bufsize;
+			if (offset <= bufcapacity - 3 && name.size() <= bufcapacity - 3 - offset)
+			{
+				buffer[offset++] = ' ';
+				copy_tag_name(buffer + offset, name.data(), name.size());
+				offset += name.size();
+				buffer[offset++] = '=';
+				buffer[offset++] = quote;
+				bufsize = offset;
+			}
+			else
+			{
+				write(' ');
+				write_buffer(name.data(), name.size());
+				write('=', quote);
+			}
+		}
+	#endif
+
+		template <bool closing> void write_tag_name(const char_t* name)
+		{
+			size_t offset = bufsize;
+			const size_t punctuation = closing ? 3 : 1;
+			if (offset <= bufcapacity - punctuation)
+			{
+				buffer[offset++] = '<';
+				if (closing) buffer[offset++] = '/';
+
+				const size_t limit = bufcapacity - (closing ? 1 : 0);
+				const char_t* rest = name;
+				while (*rest && offset < limit)
+					buffer[offset++] = *rest++;
+
+				if (!*rest && (closing || offset < bufcapacity))
+				{
+					if (closing) buffer[offset++] = '>';
+					bufsize = offset;
+					return;
+				}
+			}
+
+			if (closing) write('<', '/');
+			else write('<');
+			write_string(name);
+			if (closing) write('>');
+		}
+
+		template <bool closing> PUGI_IMPL_FORCE_INLINE void write_tag_name(const char_t* name, size_t length)
+		{
+			size_t offset = bufsize;
+			const size_t punctuation = closing ? 3 : 1;
+			if (offset <= bufcapacity - punctuation && length <= bufcapacity - punctuation - offset)
+			{
+				buffer[offset++] = '<';
+				if (closing) buffer[offset++] = '/';
+				copy_tag_name(buffer + offset, name, length);
+				offset += length;
+				if (closing) buffer[offset++] = '>';
+				bufsize = offset;
+			}
+			else
+			{
+				if (closing) write('<', '/');
+				else write('<');
+				write_buffer(name, length);
+				if (closing) write('>');
+			}
+		}
+
 		void write(char_t d0)
 		{
 			size_t offset = bufsize;
@@ -4008,14 +4288,65 @@ PUGI_IMPL_NS_BEGIN
 
 	PUGI_IMPL_FN void text_output_escaped(xml_buffered_writer& writer, const char_t* s, chartypex_t type, unsigned int flags)
 	{
+	#if defined(PUGI_IMPL_PCDATA_NEON) || defined(PUGI_IMPL_PCDATA_SSE2)
+		const char_t* limit = NULL;
+	#endif
+
 		while (*s)
 		{
 			const char_t* prev = s;
 
-			// While *s is a usual symbol
-			PUGI_IMPL_SCANWHILE_UNROLL(!PUGI_IMPL_IS_CHARTYPEX(ss, type));
+			bool copied = false;
+			const size_t probe = 8;
+			if (writer.bufsize <= xml_buffered_writer::bufcapacity - probe
+			#if defined(PUGI_IMPL_PCDATA_NEON) || defined(PUGI_IMPL_PCDATA_SSE2)
+				&& !limit
+			#endif
+			)
+			{
+				char_t* dest = writer.buffer + writer.bufsize;
+				size_t i = 0;
+				for (; i != probe; ++i)
+				{
+					char_t ch = s[i];
+					if (PUGI_IMPL_IS_CHARTYPEX(ch, type)) break;
+					dest[i] = ch;
+				}
+				s += i;
+				if (i != probe)
+				{
+					writer.bufsize += i;
+					copied = true;
+				}
+			}
 
-			writer.write_buffer(prev, static_cast<size_t>(s - prev));
+			if (!copied)
+			{
+				// While *s is a usual symbol
+			#if defined(PUGI_IMPL_PCDATA_NEON) || defined(PUGI_IMPL_PCDATA_SSE2)
+				if (type == ctx_special_pcdata)
+				{
+					if (!limit)
+					{
+						unsigned int i = 0;
+						for (; i < 16 && !PUGI_IMPL_IS_CHARTYPEX(*s, ctx_special_pcdata); ++i, ++s) {}
+						if (i == 16) limit = s + strlength(s);
+					}
+
+					if (limit)
+					{
+						s = scan_pcdata_blocks<true>(s, limit);
+						PUGI_IMPL_SCANWHILE_UNROLL(!PUGI_IMPL_IS_CHARTYPEX(ss, ctx_special_pcdata));
+					}
+				}
+				else
+			#endif
+				{
+					PUGI_IMPL_SCANWHILE_UNROLL(!PUGI_IMPL_IS_CHARTYPEX(ss, type));
+				}
+
+				writer.write_buffer(prev, static_cast<size_t>(s - prev));
+			}
 
 			switch (*s)
 			{
@@ -4088,35 +4419,48 @@ PUGI_IMPL_NS_BEGIN
 		while (*s);
 	}
 
-	PUGI_IMPL_FN void text_output_indent(xml_buffered_writer& writer, const char_t* indent, size_t indent_length, unsigned int depth)
+	template <size_t Width> PUGI_IMPL_FORCE_INLINE void text_output_indent_repeat(xml_buffered_writer& writer, const char_t* indent, unsigned int depth)
+	{
+		size_t offset = writer.bufsize;
+		if (depth <= (xml_buffered_writer::bufcapacity - offset) / Width)
+		{
+			char_t* dest = writer.buffer + offset;
+			for (unsigned int i = 0; i < depth; ++i)
+				memcpy(dest + i * Width, indent, Width * sizeof(char_t));
+			writer.bufsize = offset + depth * Width;
+		}
+		else
+		{
+			for (unsigned int i = 0; i < depth; ++i)
+				writer.write_buffer(indent, Width);
+		}
+	}
+
+	PUGI_IMPL_FN_NO_INLINE void text_output_indent_slow(xml_buffered_writer& writer, const char_t* indent, size_t indent_length, unsigned int depth)
 	{
 		switch (indent_length)
 		{
 		case 1:
 		{
-			for (unsigned int i = 0; i < depth; ++i)
-				writer.write(indent[0]);
+			text_output_indent_repeat<1>(writer, indent, depth);
 			break;
 		}
 
 		case 2:
 		{
-			for (unsigned int i = 0; i < depth; ++i)
-				writer.write(indent[0], indent[1]);
+			text_output_indent_repeat<2>(writer, indent, depth);
 			break;
 		}
 
 		case 3:
 		{
-			for (unsigned int i = 0; i < depth; ++i)
-				writer.write(indent[0], indent[1], indent[2]);
+			text_output_indent_repeat<3>(writer, indent, depth);
 			break;
 		}
 
 		case 4:
 		{
-			for (unsigned int i = 0; i < depth; ++i)
-				writer.write(indent[0], indent[1], indent[2], indent[3]);
+			text_output_indent_repeat<4>(writer, indent, depth);
 			break;
 		}
 
@@ -4126,6 +4470,42 @@ PUGI_IMPL_NS_BEGIN
 				writer.write_buffer(indent, indent_length);
 		}
 		}
+	}
+
+	PUGI_IMPL_FORCE_INLINE void text_output_indent(xml_buffered_writer& writer, const char_t* indent, size_t indent_length, unsigned int depth)
+	{
+		if constexpr (sizeof(char_t) == 1)
+		{
+			size_t offset = writer.bufsize;
+			size_t available = xml_buffered_writer::bufcapacity - offset;
+			if (available >= 8)
+			{
+				uint64_t pattern;
+				if (indent_length == 1 && depth <= 8)
+					pattern = static_cast<unsigned char>(indent[0]) * UINT64_C(0x0101010101010101);
+				else if (indent_length == 2 && depth <= 4)
+				{
+					uint16_t unit;
+					memcpy(&unit, indent, 2);
+					pattern = unit * UINT64_C(0x0001000100010001);
+				}
+				else if (indent_length == 4 && depth <= 2)
+				{
+					uint32_t unit;
+					memcpy(&unit, indent, 4);
+					pattern = unit * UINT64_C(0x0000000100000001);
+				}
+				else
+					return text_output_indent_slow(writer, indent, indent_length, depth);
+
+				// The unused suffix stays in the output buffer beyond bufsize.
+				memcpy(writer.buffer + offset, &pattern, 8);
+				writer.bufsize = offset + indent_length * depth;
+				return;
+			}
+		}
+
+		text_output_indent_slow(writer, indent, indent_length, depth);
 	}
 
 	PUGI_IMPL_FN void node_output_comment(xml_buffered_writer& writer, const char_t* s)
@@ -4174,26 +4554,25 @@ PUGI_IMPL_NS_BEGIN
 		}
 	}
 
-	PUGI_IMPL_FN void node_output_attributes(xml_buffered_writer& writer, xml_node_struct* node, const char_t* indent, size_t indent_length, unsigned int flags, unsigned int depth)
+	template <bool raw> PUGI_IMPL_FN void node_output_attributes(xml_buffered_writer& writer, xml_node_struct* node, const char_t* indent, size_t indent_length, unsigned int flags, unsigned int depth)
 	{
 		const char_t* default_name = PUGIXML_TEXT(":anonymous");
 		const char_t enquotation_char = (flags & format_attribute_single_quote) ? '\'' : '"';
 
 		for (xml_attribute_struct* a = node->first_attribute; a; a = a->next_attribute)
 		{
-			if ((flags & (format_indent_attributes | format_raw)) == format_indent_attributes)
+			const char_t* name = a->name ? a->name + 0 : default_name;
+			if (!raw && (flags & format_indent_attributes))
 			{
 				writer.write('\n');
-
 				text_output_indent(writer, indent, indent_length, depth + 1);
+				writer.write_string(name);
+				writer.write('=', enquotation_char);
 			}
 			else
 			{
-				writer.write(' ');
+				writer.write_attribute_start(name, enquotation_char);
 			}
-
-			writer.write_string(a->name ? a->name + 0 : default_name);
-			writer.write('=', enquotation_char);
 
 			if (a->value)
 				text_output(writer, a->value, ctx_special_attr, flags);
@@ -4202,6 +4581,148 @@ PUGI_IMPL_NS_BEGIN
 		}
 	}
 
+#ifdef PUGIXML_HAS_STRING_VIEW
+	PUGI_IMPL_FN void write_view(xml_buffered_writer& writer, string_view_t value)
+	{
+		if (!value.empty()) writer.write_buffer(value.data(), value.size());
+	}
+
+	template <typename Writer> void write_view_escape(Writer& writer, char_t ch, unsigned int flags)
+	{
+		switch (ch)
+		{
+		case '&': writer.write('&', 'a', 'm', 'p', ';'); break;
+		case '<': writer.write('&', 'l', 't', ';'); break;
+		case '>': writer.write('&', 'g', 't', ';'); break;
+		case '"':
+			if (flags & format_attribute_single_quote) writer.write('"');
+			else writer.write('&', 'q', 'u', 'o', 't', ';');
+			break;
+		case '\'':
+			if (flags & format_attribute_single_quote) writer.write('&', 'a', 'p', 'o', 's', ';');
+			else writer.write('\'');
+			break;
+		default:
+			if (!(flags & format_skip_control_chars))
+				writer.write('&', '#', '0' + ch / 10, '0' + ch % 10, ';');
+		}
+	}
+
+	struct sax_output_cursor
+	{
+		char_t* current;
+
+		template <typename... Chars> void write(Chars... values)
+		{
+			((*current++ = static_cast<char_t>(values)), ...);
+		}
+	};
+
+	PUGI_IMPL_FN void text_output_view(xml_buffered_writer& writer, string_view_t value, chartypex_t type, unsigned int flags)
+	{
+		if (value.empty()) return;
+		if (flags & format_no_escapes)
+		{
+			write_view(writer, value);
+			return;
+		}
+
+	#if defined(PUGI_IMPL_PCDATA_NEON) || defined(PUGI_IMPL_PCDATA_SSE2)
+		if (type == ctx_special_pcdata && value.size() >= 16)
+		{
+			const char_t* begin = value.data();
+			const char_t* end = begin + value.size();
+			const char_t* split = scan_pcdata_blocks<true>(begin, end);
+			while (split != end && !PUGI_IMPL_IS_CHARTYPEX(*split, ctx_special_pcdata)) ++split;
+			size_t count = static_cast<size_t>(split - begin);
+			if (count)
+			{
+				size_t offset = writer.bufsize;
+				if (count <= xml_buffered_writer::bufcapacity - offset)
+				{
+					copy_tag_name(writer.buffer + offset, begin, count);
+					writer.bufsize += count;
+				}
+				else writer.write_buffer(begin, count);
+
+				value.remove_prefix(count);
+				if (value.empty()) return;
+			}
+		}
+	#endif
+
+		// A single capacity check covers the worst-case expansion of a short
+		// value. The inner loop can then write bytes and escapes directly.
+		if (value.size() <= 64 && value.size() * 6 <= xml_buffered_writer::bufcapacity - writer.bufsize)
+		{
+			sax_output_cursor output{writer.buffer + writer.bufsize};
+			for (char_t ch: value)
+			{
+				if (PUGI_IMPL_IS_CHARTYPEX(ch, type)) write_view_escape(output, ch, flags);
+				else output.write(ch);
+			}
+			writer.bufsize = static_cast<size_t>(output.current - writer.buffer);
+			return;
+		}
+
+		const char_t* s = value.data();
+		const char_t* end = s + value.size();
+		while (s != end)
+		{
+			const char_t* begin = s;
+		#if defined(PUGI_IMPL_PCDATA_NEON) || defined(PUGI_IMPL_PCDATA_SSE2)
+			if (type == ctx_special_pcdata) s = scan_pcdata_blocks<true>(s, end);
+		#endif
+			while (s != end && !PUGI_IMPL_IS_CHARTYPEX(*s, type)) ++s;
+			if (s != begin) writer.write_buffer(begin, static_cast<size_t>(s - begin));
+			if (s != end) write_view_escape(writer, *s++, flags);
+		}
+	}
+
+	PUGI_IMPL_FN void text_output_cdata_view(xml_buffered_writer& writer, string_view_t value)
+	{
+		for (;;)
+		{
+			writer.write('<', '!', '[', 'C', 'D');
+			writer.write('A', 'T', 'A', '[');
+			size_t split = value.find(PUGIXML_TEXT("]]>"));
+			write_view(writer, value.substr(0, split == string_view_t::npos ? split : split + 2));
+			writer.write(']', ']', '>');
+			if (split == string_view_t::npos) return;
+			value.remove_prefix(split + 2);
+		}
+	}
+
+	PUGI_IMPL_FN void node_output_comment_view(xml_buffered_writer& writer, string_view_t value)
+	{
+		writer.write('<', '!', '-', '-');
+
+		size_t begin = 0;
+		for (size_t i = value.find('-'); i != string_view_t::npos; i = value.find('-', i + 1))
+			if (i + 1 == value.size() || value[i + 1] == '-')
+			{
+				write_view(writer, value.substr(begin, i - begin + 1));
+				writer.write(' ');
+				begin = i + 1;
+			}
+		write_view(writer, value.substr(begin));
+
+		writer.write('-', '-', '>');
+	}
+
+	PUGI_IMPL_FN void node_output_pi_view(xml_buffered_writer& writer, string_view_t value)
+	{
+		for (size_t i = value.find(PUGIXML_TEXT("?>")); i != string_view_t::npos; i = value.find(PUGIXML_TEXT("?>")))
+		{
+			write_view(writer, value.substr(0, i));
+			writer.write('?', ' ', '>');
+			value.remove_prefix(i + 2);
+		}
+
+		write_view(writer, value);
+	}
+#endif
+
 	PUGI_IMPL_FN bool node_output_empty(xml_node_struct* node)
 	{
 		xml_node_struct* child = node->first_child;
@@ -4209,16 +4730,15 @@ PUGI_IMPL_NS_BEGIN
 		return !child || (!child->next_sibling && PUGI_IMPL_NODETYPE(child) == node_pcdata && (!child->value || !child->value[0]));
 	}
 
-	PUGI_IMPL_FN bool node_output_start(xml_buffered_writer& writer, xml_node_struct* node, const char_t* indent, size_t indent_length, unsigned int flags, unsigned int depth)
+	template <bool raw> PUGI_IMPL_FN bool node_output_start(xml_buffered_writer& writer, xml_node_struct* node, const char_t* indent, size_t indent_length, unsigned int flags, unsigned int depth)
 	{
 		const char_t* default_name = PUGIXML_TEXT(":anonymous");
 		const char_t* name = node->name ? node->name + 0 : default_name;
 
-		writer.write('<');
-		writer.write_string(name);
+		writer.write_tag_name<false>(name);
 
 		if (node->first_attribute)
-			node_output_attributes(writer, node, indent, indent_length, flags, depth);
+			node_output_attributes<raw>(writer, node, indent, indent_length, flags, depth);
 
 		// element nodes can have value if parse_embed_pcdata was used
 		if (!node->value)
@@ -4235,7 +4755,7 @@ PUGI_IMPL_NS_BEGIN
 				}
 				else
 				{
-					if ((flags & format_raw) == 0)
+					if (!raw)
 						writer.write(' ');
 
 					writer.write('/', '>');
@@ -4258,9 +4778,7 @@ PUGI_IMPL_NS_BEGIN
 
 			if (!node->first_child)
 			{
-				writer.write('<', '/');
-				writer.write_string(name);
-				writer.write('>');
+				writer.write_tag_name<true>(name);
 
 				return false;
 			}
@@ -4276,9 +4794,7 @@ PUGI_IMPL_NS_BEGIN
 		const char_t* default_name = PUGIXML_TEXT(":anonymous");
 		const char_t* name = node->name ? node->name + 0 : default_name;
 
-		writer.write('<', '/');
-		writer.write_string(name);
-		writer.write('>');
+		writer.write_tag_name<true>(name);
 	}
 
 	PUGI_IMPL_FN void node_output_simple(xml_buffered_writer& writer, xml_node_struct* node, unsigned int flags)
@@ -4315,7 +4831,7 @@ PUGI_IMPL_NS_BEGIN
 			case node_declaration:
 				writer.write('<', '?');
 				writer.write_string(node->name ? node->name + 0 : default_name);
-				node_output_attributes(writer, node, PUGIXML_TEXT(""), 0, flags | format_raw, 0);
+				node_output_attributes<true>(writer, node, PUGIXML_TEXT(""), 0, flags, 0);
 				writer.write('?', '>');
 				break;
 
@@ -4343,9 +4859,9 @@ PUGI_IMPL_NS_BEGIN
 		indent_indent = 2
 	};
 
-	PUGI_IMPL_FN void node_output(xml_buffered_writer& writer, xml_node_struct* root, const char_t* indent, unsigned int flags, unsigned int depth)
+	template <bool raw> PUGI_IMPL_FN void node_output_impl(xml_buffered_writer& writer, xml_node_struct* root, const char_t* indent, unsigned int flags, unsigned int depth)
 	{
-		size_t indent_length = ((flags & (format_indent | format_indent_attributes)) && (flags & format_raw) == 0) ? strlength(indent) : 0;
+		size_t indent_length = (!raw && (flags & (format_indent | format_indent_attributes))) ? strlength(indent) : 0;
 		unsigned int indent_flags = indent_indent;
 
 		xml_node_struct* node = root;
@@ -4363,7 +4879,7 @@ PUGI_IMPL_NS_BEGIN
 			}
 			else
 			{
-				if ((indent_flags & indent_newline) && (flags & format_raw) == 0)
+				if (!raw && (indent_flags & indent_newline))
 					writer.write('\n');
 
 				if ((indent_flags & indent_indent) && indent_length)
@@ -4373,7 +4889,7 @@ PUGI_IMPL_NS_BEGIN
 				{
 					indent_flags = indent_newline | indent_indent;
 
-					if (node_output_start(writer, node, indent, indent_length, flags, depth))
+					if (node_output_start<raw>(writer, node, indent, indent_length, flags, depth))
 					{
 						// element nodes can have value if parse_embed_pcdata was used
 						if (node->value)
@@ -4418,7 +4934,7 @@ PUGI_IMPL_NS_BEGIN
 				{
 					depth--;
 
-					if ((indent_flags & indent_newline) && (flags & format_raw) == 0)
+					if (!raw && (indent_flags & indent_newline))
 						writer.write('\n');
 
 					if ((indent_flags & indent_indent) && indent_length)
@@ -4432,8 +4948,16 @@ PUGI_IMPL_NS_BEGIN
 		}
 		while (node != root);
 
-		if ((indent_flags & indent_newline) && (flags & format_raw) == 0)
+		if (!raw && (indent_flags & indent_newline))
 			writer.write('\n');
+	}
+
+	PUGI_IMPL_FN void node_output(xml_buffered_writer& writer, xml_node_struct* root, const char_t* indent, unsigned int flags, unsigned int depth)
+	{
+		if (flags & format_raw)
+			node_output_impl<true>(writer, root, indent, flags, depth);
+		else
+			node_output_impl<false>(writer, root, indent, flags, depth);
 	}
 
 	PUGI_IMPL_FN bool has_declaration(xml_node_struct* node)
@@ -4667,7 +5191,7 @@ PUGI_IMPL_NS_BEGIN
 
 			size_t digits = static_cast<size_t>(s - start);
 
-			PUGI_IMPL_STATIC_ASSERT(sizeof(U) == 8 || sizeof(U) == 4 || sizeof(U) == 2);
+			static_assert(sizeof(U) == 8 || sizeof(U) == 4 || sizeof(U) == 2);
 
 			const size_t max_digits10 = sizeof(U) == 8 ? 20 : sizeof(U) == 4 ? 10 : 5;
 			const char_t max_lead = sizeof(U) == 8 ? '1' : sizeof(U) == 4 ? '4' : '6';
@@ -4861,7 +5385,10 @@ PUGI_IMPL_NS_BEGIN
 		char_t* buffer = NULL;
 		size_t length = 0;
 
-		if (!impl::convert_buffer(buffer, length, buffer_encoding, contents, size, is_mutable)) return impl::make_parse_result(status_out_of_memory);
+		bool converted = buffer_encoding == get_write_native_encoding()
+			? get_mutable_buffer(buffer, length, contents, size, is_mutable)
+			: convert_buffer(buffer, length, buffer_encoding, contents, size, is_mutable);
+		if (!converted) return make_parse_result(status_out_of_memory);
 
 		// after this we either deallocate contents (below) or hold on to it via doc->buffer, so we don't need to guard it
 		contents_guard.release();
@@ -5228,6 +5755,1930 @@ PUGI_IMPL_NS_BEGIN
 		return fflush(file) == 0 && ferror(file) == 0;
 	}
 
+	// SAX keeps input in a sliding window. Buffer growth is only needed when
+	// an event spans the window, or when the nesting depth or attribute count grows.
+	template <typename T, size_t Inline> struct sax_buffer
+	{
+		T* data;
+		size_t capacity;
+
+		sax_buffer(): data(storage), capacity(Inline) {}
+		~sax_buffer() { if (data != storage) xml_memory::deallocate(data); }
+
+		bool reserve(size_t count, size_t preserve)
+		{
+			if (count <= capacity) return true;
+
+			const size_t max_capacity = static_cast<size_t>(-1) / sizeof(T);
+			if (count > max_capacity) return false;
+
+			size_t next = capacity <= max_capacity / 2 ? capacity * 2 : capacity;
+			if (next < 16) next = 16;
+			if (next < count) next = count;
+
+			T* buffer = static_cast<T*>(xml_memory::allocate(next * sizeof(T)));
+			if (!buffer) return false;
+
+			if (preserve) memcpy(buffer, data, preserve * sizeof(T));
+			if (data != storage) xml_memory::deallocate(data);
+			data = buffer;
+			capacity = next;
+			return true;
+		}
+
+		void trim(size_t& budget)
+		{
+			if (data == storage) return;
+			if (capacity * sizeof(T) <= budget)
+			{
+				budget -= capacity * sizeof(T);
+				return;
+			}
+
+			xml_memory::deallocate(data);
+			data = storage;
+			capacity = Inline;
+		}
+
+		struct dynamic_storage { T* data; size_t capacity; };
+
+		dynamic_storage detach()
+		{
+			if (data == storage) return {NULL, 0};
+			dynamic_storage result{data, capacity};
+			data = storage;
+			capacity = Inline;
+			return result;
+		}
+
+		void attach(dynamic_storage memory)
+		{
+			assert(data == storage);
+			if (memory.data)
+			{
+				data = memory.data;
+				capacity = memory.capacity;
+			}
+		}
+
+	private:
+		alignas(T) alignas(wchar_t) alignas(uint32_t) T storage[Inline];
+
+		sax_buffer(const sax_buffer&);
+		sax_buffer& operator=(const sax_buffer&);
+	};
+
+	struct sax_frame
+	{
+		size_t name;
+		bool has_child;
+	};
+
+	struct sax_borrowed_frame: sax_frame
+	{
+		const char_t* borrowed;
+		size_t length;
+	};
+
+	template <bool track_children, bool can_borrow = false> struct sax_stack
+	{
+		sax_buffer<char_t, 128> names;
+		sax_buffer<std::conditional_t<can_borrow, sax_borrowed_frame, sax_frame>, 8> frames;
+		size_t size;
+		size_t used;
+
+		sax_stack(): size(0), used(0) {}
+
+		template <bool terminated = true> bool push(const char_t* name, size_t length)
+		{
+			if (length >= static_cast<size_t>(-1) - used) return false;
+			if (!frames.reserve(size + 1, size) || !names.reserve(used + length + 1, used)) return false;
+			mark_child();
+			frames.data[size].name = used;
+			frames.data[size].has_child = false;
+			if constexpr (can_borrow) frames.data[size].borrowed = NULL;
+			++size;
+			if constexpr (terminated)
+			{
+				if (!track_children && length < 16)
+					copy_tag_name(names.data + used, name, length + 1);
+				else
+					memcpy(names.data + used, name, (length + 1) * sizeof(char_t));
+			}
+			else
+			{
+				copy_tag_name(names.data + used, name, length);
+				names.data[used + length] = 0;
+			}
+			used += length + 1;
+			return true;
+		}
+
+		bool borrow(const char_t* name, size_t length)
+		{
+			static_assert(can_borrow);
+			if (!frames.reserve(size + 1, size)) return false;
+			mark_child();
+			frames.data[size++] = {{used, false}, name, length};
+			return true;
+		}
+
+		void mark_child() { if (track_children && size) frames.data[size - 1].has_child = true; }
+		bool has_child() const { return size && frames.data[size - 1].has_child; }
+		const char_t* top() const
+		{
+			if constexpr (can_borrow)
+				if (frames.data[size - 1].borrowed) return frames.data[size - 1].borrowed;
+			return names.data + frames.data[size - 1].name;
+		}
+
+		size_t length() const
+		{
+			if constexpr (can_borrow)
+				if (frames.data[size - 1].borrowed) return frames.data[size - 1].length;
+			return used - frames.data[size - 1].name - 1;
+		}
+		void pop() { used = frames.data[--size].name; }
+	};
+
+	PUGI_IMPL_FN size_t sax_utf8_prefix(const uint8_t* data, size_t size)
+	{
+		// Keep an unfinished sequence for the next read. The existing decoder
+		// determines how to handle malformed bytes once their context is available.
+		for (size_t i = 1; i <= size && i <= 3; ++i)
+		{
+			uint8_t ch = data[size - i];
+			if (ch < 0x80) break;
+			if (ch < 0xc0) continue;
+
+			size_t width = ch < 0xe0 ? 2 : ch < 0xf0 ? 3 : ch < 0xf8 ? 4 : 1;
+			return width > i ? size - i : size;
+		}
+
+		return size;
+	}
+
+	struct sax_memory_reader: xml_reader
+	{
+		const unsigned char* data;
+		size_t remaining;
+
+		sax_memory_reader(const void* data_, size_t size): data(static_cast<const unsigned char*>(data_)), remaining(size) {}
+
+		void consume(size_t size) { data += size; remaining -= size; }
+
+		virtual size_t read(void* buffer, size_t size)
+		{
+			if (size > remaining) size = remaining;
+			if (size)
+			{
+				memcpy(buffer, data, size);
+				consume(size);
+			}
+			return size;
+		}
+	};
+
+	template <bool reusable> struct sax_input
+	{
+		enum { initial_size = 512, block_size = 65536 };
+
+		std::conditional_t<reusable, xml_reader*, xml_reader&> reader;
+		sax_buffer<uint8_t, initial_size> raw;
+		sax_buffer<char_t, initial_size + 4> buffer;
+		size_t raw_size;
+		size_t begin;
+		size_t end;
+		size_t offset;
+		xml_encoding encoding;
+		xml_parse_status status;
+		bool eof;
+		bool use_blocks;
+
+		static decltype(auto) bind(xml_reader* source)
+		{
+			if constexpr (reusable) return source;
+			else return *source;
+		}
+
+		explicit sax_input(xml_reader* reader_): reader(bind(reader_)), raw_size(0), begin(0), end(0), offset(0), encoding(encoding_auto), status(status_ok), eof(false), use_blocks(false) {}
+
+		void reset(xml_reader& source)
+		{
+			reader = &source;
+			raw_size = begin = end = offset = 0;
+			encoding = encoding_auto;
+			status = status_ok;
+			eof = use_blocks = false;
+		}
+
+		size_t read(void* data, size_t size)
+		{
+			if (eof || status != status_ok) return 0;
+
+			size_t result;
+			if constexpr (reusable) result = reader->read(data, size);
+			else result = reader.read(data, size);
+			if (result > size)
+			{
+				status = status_io_error;
+				return 0;
+			}
+
+			eof = result == 0;
+			return result;
+		}
+
+		bool reserve(size_t count)
+		{
+			if (count > static_cast<size_t>(-1) - 4 || !buffer.reserve(count + 4, end))
+			{
+				status = status_out_of_memory;
+				return false;
+			}
+
+			return true;
+		}
+
+		void terminate() { memset(buffer.data + end, 0, 4 * sizeof(char_t)); }
+		char_t* data() const { return buffer.data + begin; }
+		size_t available() const { return end - begin; }
+		void consume(size_t count) { assert(count <= available()); begin += count; offset += count; }
+
+		bool read_raw(size_t request)
+		{
+			if (eof || status != status_ok) return false;
+
+			if (raw_size > static_cast<size_t>(-1) - request || !raw.reserve(raw_size + request, raw_size))
+			{
+				status = status_out_of_memory;
+				return false;
+			}
+
+			size_t count = read(raw.data + raw_size, request);
+			raw_size += count;
+			return count != 0;
+		}
+
+		bool initialize(xml_encoding requested)
+		{
+			while (raw_size < 6 && read_raw(initial_size - raw_size)) {}
+			if (status != status_ok) return false;
+
+			// The DOM can infer Latin-1 from the initial XML declaration.
+			if (requested == encoding_auto && raw_size >= 6 && memcmp(raw.data, "<?xml", 5) == 0 && PUGI_IMPL_IS_CHARTYPE(raw.data[5], ct_space))
+			{
+				size_t scanned = 6;
+				while (!memchr(raw.data + scanned, '?', raw_size - scanned))
+				{
+					scanned = raw_size;
+					if (!read_raw(next_read_size(raw_size))) break;
+				}
+			}
+
+			if (status != status_ok) return false;
+			encoding = get_buffer_encoding(requested, raw.data, raw_size);
+			use_blocks = raw_size >= initial_size;
+
+			terminate();
+			if (raw_size) append_raw();
+			while (!available() && !eof && status == status_ok) more();
+			if (status != status_ok) return false;
+
+			consume(static_cast<size_t>(xml_parser::parse_skip_bom(data()) - data()));
+			return true;
+		}
+
+		bool initialize_memory(xml_encoding requested, sax_memory_reader& memory)
+		{
+			size_t count = memory.remaining < initial_size ? memory.remaining : initial_size;
+			if (!count || get_buffer_encoding(requested, memory.data, count) != encoding_utf8) return false;
+
+			// The declaration may need more lookahead to detect Latin-1.
+			if (requested == encoding_auto && count >= 6 && memcmp(memory.data, "<?xml", 5) == 0 && PUGI_IMPL_IS_CHARTYPE(memory.data[5], ct_space))
+				return false;
+
+			memcpy(buffer.data, memory.data, count);
+			memory.consume(count);
+			encoding = encoding_utf8;
+			end = count;
+			use_blocks = count == initial_size;
+			eof = count < 6;
+			terminate();
+			consume(static_cast<size_t>(xml_parser::parse_skip_bom(data()) - data()));
+			return true;
+		}
+
+		size_t raw_prefix() const
+		{
+			if (encoding == encoding_utf8)
+				return sizeof(char_t) == 1 ? raw_size : sax_utf8_prefix(raw.data, raw_size);
+
+			if (encoding == encoding_utf16_le || encoding == encoding_utf16_be)
+			{
+				size_t length = raw_size & ~size_t(1);
+				if (length >= 2)
+				{
+					const uint8_t* last = raw.data + length - 2;
+					uint8_t high = last[encoding == encoding_utf16_le ? 1 : 0];
+					if ((high & 0xfc) == 0xd8) length -= 2;
+				}
+				return length;
+			}
+
+			if (encoding == encoding_utf32_le || encoding == encoding_utf32_be)
+				return raw_size & ~size_t(3);
+
+			return raw_size;
+		}
+
+		void append_raw()
+		{
+			size_t length = eof ? raw_size : raw_prefix();
+			if (!length) return;
+
+			char_t* converted = NULL;
+			size_t count = 0;
+			if (!convert_buffer(converted, count, encoding, raw.data, length, true))
+			{
+				status = status_out_of_memory;
+				return;
+			}
+
+			// The in-place conversion reports no terminator. Allocated results
+			// have one, which is replaced by the window's own padding.
+			bool allocated = static_cast<void*>(converted) != raw.data;
+			auto_deleter<void> guard(allocated ? converted : NULL, xml_memory::deallocate);
+			if (allocated) --count;
+
+			if (count > static_cast<size_t>(-1) - end)
+				status = status_out_of_memory;
+			else if (reserve(end + count))
+			{
+				memcpy(buffer.data + end, converted, count * sizeof(char_t));
+				end += count;
+				terminate();
+			}
+
+			raw_size -= length;
+			if (raw_size) memmove(raw.data, raw.data + length, raw_size);
+		}
+
+		bool more()
+		{
+			if (status != status_ok || (eof && raw_size == 0)) return false;
+
+			if (begin)
+			{
+				end -= begin;
+				memmove(buffer.data, buffer.data + begin, end * sizeof(char_t));
+				begin = 0;
+				terminate();
+			}
+
+			if (sizeof(char_t) == 1 && encoding == encoding_utf8)
+			{
+				size_t request = next_read_size(end);
+				if (end > static_cast<size_t>(-1) - request)
+				{
+					status = status_out_of_memory;
+					return false;
+				}
+				if (!reserve(end + request)) return false;
+				size_t count = read(buffer.data + end, request);
+				use_blocks = count != 0;
+				end += count;
+				terminate();
+				return count != 0;
+			}
+
+			size_t previous = end;
+			do
+			{
+				if (read_raw(next_read_size(raw_size))) use_blocks = true;
+				if (status == status_ok) append_raw();
+			}
+			while (end == previous && !eof && status == status_ok);
+
+			return status == status_ok && end != previous;
+		}
+
+		size_t next_read_size(size_t used) const
+		{
+			return use_blocks || used >= initial_size ? block_size : initial_size - used;
+		}
+
+		char_t peek(size_t index)
+		{
+			while (index >= available())
+				if (!more()) return 0;
+
+			return data()[index];
+		}
+	};
+
+	PUGI_IMPL_FN char_t* sax_find(char_t* s, char_t ch)
+	{
+	#ifdef PUGIXML_WCHAR_MODE
+		return wcschr(s, ch);
+	#else
+		return strchr(s, ch);
+	#endif
+	}
+
+	PUGI_IMPL_FN char_t* sax_find_last(char_t* s, char_t ch)
+	{
+	#ifdef PUGIXML_WCHAR_MODE
+		return wcsrchr(s, ch);
+	#else
+		return strrchr(s, ch);
+	#endif
+	}
+
+	PUGI_IMPL_FN bool sax_contains(const char_t* s, size_t length, char_t ch)
+	{
+	#ifdef PUGIXML_WCHAR_MODE
+		return wmemchr(s, ch, length) != NULL;
+	#else
+		return memchr(s, ch, length) != NULL;
+	#endif
+	}
+
+	PUGI_IMPL_FN bool sax_reference_digit(char_t ch, bool hex)
+	{
+		unsigned int code = static_cast<unsigned int>(ch);
+		return code - '0' <= 9 || (hex && ((code | ' ') - 'a') <= 5);
+	}
+
+	PUGI_IMPL_FN size_t sax_complete_text(char_t* data, size_t size, unsigned int options)
+	{
+		size_t length = size;
+	#ifdef PUGIXML_WCHAR_MODE
+		length = get_valid_length(data, length);
+	#else
+		if (length && static_cast<uint8_t>(data[length - 1]) >= 0x80)
+			length = sax_utf8_prefix(reinterpret_cast<const uint8_t*>(data), length);
+	#endif
+		if ((options & parse_eol) && length && data[length - 1] == '\r') --length;
+
+		if (options & parse_escapes)
+		{
+			char_t* amp = sax_find_last(data, '&');
+			if (amp && amp < data + length)
+			{
+				char_t* s = amp + 1;
+				char_t* end = data + size;
+
+				if (s < end && *s == '#')
+				{
+					++s;
+					bool hex = s < end && *s == 'x';
+					if (hex) ++s;
+
+					while (s < end && sax_reference_digit(*s, hex)) ++s;
+				}
+				else
+				{
+					while (s < end && s - amp < 6 && static_cast<unsigned int>(*s) - 'a' < 26) ++s;
+				}
+
+				if (s == end) length = static_cast<size_t>(amp - data);
+			}
+		}
+
+		return length;
+	}
+
+	// The end of a whitespace run can determine whether SAX should emit it.
+	// Keep uniform runs as a count, and pack mixed runs in fixed-size pages so
+	// the queue never reallocates or copies a large accumulated suffix.
+	struct sax_pending_space
+	{
+		enum { page_bytes = 4096, page_chars = page_bytes * 4 };
+
+		struct page
+		{
+			page* next;
+			size_t size;
+			char_t repeat;
+		};
+
+		page* first;
+		page* last;
+		size_t read_offset;
+		size_t run_size;
+		char_t run_char;
+
+		sax_pending_space(): first(NULL), last(NULL), read_offset(0), run_size(0), run_char(0) {}
+		~sax_pending_space() { while (first) pop(); }
+
+		void pop()
+		{
+			page* head = first;
+			first = head->next;
+			if (!first) last = NULL;
+			read_offset = 0;
+			xml_memory::deallocate(head);
+		}
+
+		bool append_page(char_t repeat, size_t size)
+		{
+			void* memory = xml_memory::allocate(sizeof(page) + (repeat ? 0 : page_bytes));
+			if (!memory) return false;
+
+			page* next = static_cast<page*>(memory);
+			next->next = NULL;
+			next->size = size;
+			next->repeat = repeat;
+			if (last) last->next = next;
+			else first = next;
+			last = next;
+			return true;
+		}
+
+		bool save_run()
+		{
+			if (run_size >= page_chars)
+				return append_page(run_char, run_size);
+
+			unsigned int code = run_char == ' ' ? 0 : run_char == '\t' ? 1 : run_char == '\r' ? 2 : 3;
+			for (size_t i = 0; i < run_size; ++i)
+			{
+				if (!last || last->repeat || last->size == page_chars)
+					if (!append_page(0, 0)) return false;
+
+				uint8_t* bytes = reinterpret_cast<uint8_t*>(last + 1);
+				size_t index = last->size++;
+				unsigned int shift = static_cast<unsigned int>(index % 4) * 2;
+				if (shift == 0) bytes[index / 4] = 0;
+				bytes[index / 4] |= static_cast<uint8_t>(code << shift);
+			}
+			return true;
+		}
+
+		bool add(const char_t* data, size_t size)
+		{
+			const char_t* end = data + size;
+			while (data != end)
+			{
+				char_t ch = *data;
+				const char_t* next = data + 1;
+				while (next != end && *next == ch) ++next;
+
+				size_t count = static_cast<size_t>(next - data);
+				if (run_size && (run_char != ch || count > static_cast<size_t>(-1) - run_size))
+				{
+					if (!save_run()) return false;
+					run_size = 0;
+				}
+				run_char = ch;
+				run_size += count;
+				data = next;
+			}
+			return true;
+		}
+
+		bool empty() const { return !first && !run_size; }
+
+		size_t take(char_t* data, size_t capacity)
+		{
+			const char_t* codes = PUGIXML_TEXT(" \t\r\n");
+			if (!first)
+			{
+				size_t count = run_size < capacity ? run_size : capacity;
+				for (size_t i = 0; i < count; ++i) data[i] = run_char;
+				run_size -= count;
+				return count;
+			}
+
+			size_t size = first->size - read_offset;
+			size_t count = size < capacity ? size : capacity;
+			const uint8_t* bytes = reinterpret_cast<const uint8_t*>(first + 1);
+			for (size_t i = 0; i < count; ++i)
+			{
+				size_t index = read_offset + i;
+				data[i] = first->repeat ? first->repeat : codes[(bytes[index / 4] >> (index % 4 * 2)) & 3];
+			}
+			read_offset += count;
+			if (read_offset == first->size) pop();
+			return count;
+		}
+
+	private:
+		sax_pending_space(const sax_pending_space&);
+		sax_pending_space& operator=(const sax_pending_space&);
+	};
+
+	struct sax_attribute_offset
+	{
+		size_t name;
+		size_t value;
+	};
+
+	// The C-string specialization keeps the existing callback and offset layout.
+	struct sax_cstring_events
+	{
+		typedef xml_sax_attribute attribute;
+		typedef sax_attribute_offset offset;
+		static constexpr bool sized = false;
+		xml_sax_handler* const sink;
+
+		static attribute make_attribute(const char_t* name, size_t, const char_t* value, size_t) { return {name, value}; }
+		bool start_element(const char_t* name, size_t, const attribute* list, size_t count) { return sink->start_element(name, list, count); }
+		bool end_element(const char_t* name, size_t) { return sink->end_element(name); }
+		bool text(xml_node_type type, const char_t* value, size_t) { return sink->text(type, value); }
+		bool processing_instruction(const char_t* name, const char_t* value) { return sink->processing_instruction(name, value); }
+		bool declaration(const char_t* name, const attribute* list, size_t count) { return sink->declaration(name, list, count); }
+		bool start_attribute(const char_t* name, size_t) { return sink->start_attribute(name); }
+		bool attribute_value(const char_t* value, size_t) { return sink->attribute_value(value); }
+		bool comment_chunk(const char_t* value, size_t, bool last) { return sink->comment_chunk(value, last); }
+	};
+
+#ifdef PUGIXML_HAS_STRING_VIEW
+	struct sax_view_events
+	{
+		typedef xml_sax_attribute_view attribute;
+		struct offset: sax_attribute_offset { size_t name_length, value_length; };
+		static constexpr bool sized = true;
+		xml_sax_view_handler* sink;
+
+		static string_view_t view(const char_t* value, size_t length = string_view_t::npos)
+		{
+			return string_view_t(value, length == string_view_t::npos ? strlength(value) : length);
+		}
+
+		static attribute make_attribute(const char_t* name, size_t name_length, const char_t* value, size_t value_length) { return {view(name, name_length), view(value, value_length)}; }
+		bool start_element(const char_t* name, size_t length, const attribute* list, size_t count) { return sink->start_element(view(name, length), {list, count}); }
+		bool end_element(const char_t* name, size_t length) { return sink->end_element(view(name, length)); }
+		bool text(xml_node_type type, const char_t* value, size_t length) { return sink->text(type, view(value, length)); }
+		bool processing_instruction(const char_t* name, const char_t* value) { return sink->processing_instruction(view(name), view(value)); }
+		bool declaration(const char_t* name, const attribute* list, size_t count) { return sink->declaration(view(name), {list, count}); }
+		bool start_attribute(const char_t* name, size_t length) { return sink->start_attribute(view(name, length)); }
+		bool attribute_value(const char_t* value, size_t length) { return sink->attribute_value(view(value, length)); }
+		bool comment_chunk(const char_t* value, size_t length, bool last) { return sink->comment_chunk(view(value, length), last); }
+	};
+#endif
+
+	template <typename Events> struct sax_parser
+	{
+		sax_input<Events::sized> input;
+		Events handler;
+		std::conditional_t<Events::sized, unsigned int, const unsigned int> options;
+		std::conditional_t<Events::sized, strconv_attribute_t, const strconv_attribute_t> convert_attribute;
+		std::conditional_t<Events::sized, strconv_sax_pcdata_t, const strconv_sax_pcdata_t> convert_text;
+		sax_stack<true, Events::sized> stack;
+		sax_buffer<typename Events::offset, 4> offsets;
+		sax_buffer<typename Events::attribute, 4> attributes;
+		size_t attribute_count;
+		bool has_element;
+
+		static strconv_sax_pcdata_t select_text_converter(unsigned int flags)
+		{
+			if constexpr (Events::sized)
+				return get_strconv_pcdata_impl<strconv_sax_pcdata_t, strconv_sax_view_pcdata_impl>(flags & ~parse_trim_pcdata);
+			else
+				return get_strconv_pcdata_impl<strconv_sax_pcdata_t, strconv_sax_pcdata_impl>(flags & ~parse_trim_pcdata);
+		}
+
+		sax_parser(xml_reader* reader, Events handler_, unsigned int options_):
+			input(reader), handler(handler_), options(options_), convert_attribute(get_strconv_attribute(options_)),
+			convert_text(select_text_converter(options_)), attribute_count(0), has_element(false) {}
+
+		void reset(xml_reader& reader, Events events, unsigned int options_)
+		{
+			input.reset(reader);
+			handler = events;
+			options = options_;
+			convert_attribute = get_strconv_attribute(options);
+			convert_text = select_text_converter(options);
+			stack.size = stack.used = attribute_count = 0;
+			has_element = false;
+		}
+
+		void trim(size_t budget)
+		{
+			input.buffer.trim(budget);
+			input.raw.trim(budget);
+			stack.names.trim(budget);
+			stack.frames.trim(budget);
+			attributes.trim(budget);
+			offsets.trim(budget);
+		}
+
+		bool fail(xml_parse_status status, size_t position = 0)
+		{
+			if (input.status == status_ok) input.status = status;
+			input.offset += position;
+			return false;
+		}
+
+		bool event(bool proceed)
+		{
+			return proceed || fail(status_sax_aborted);
+		}
+
+		size_t scan_name(size_t index)
+		{
+			for (;;)
+			{
+				char_t* data = input.data();
+				char_t* s = data + index;
+				PUGI_IMPL_SCANWHILE_UNROLL(PUGI_IMPL_IS_CHARTYPE(ss, ct_symbol));
+				index = static_cast<size_t>(s - data);
+				if (index != input.available() || !input.more()) return index;
+			}
+		}
+
+		size_t skip_space(size_t index)
+		{
+			for (;;)
+			{
+				char_t* data = input.data();
+				char_t* s = data + index;
+				PUGI_IMPL_SKIPWS();
+				index = static_cast<size_t>(s - data);
+				if (index != input.available() || !input.more()) return index;
+			}
+		}
+
+		size_t scan_char(size_t index, char_t ch)
+		{
+			for (;;)
+			{
+				char_t* data = input.data();
+				char_t* s = sax_find(data + index, ch);
+				if (s) return static_cast<size_t>(s - data);
+
+				index += strlength(data + index);
+				if (index != input.available() || !input.more()) return index;
+			}
+		}
+
+		bool parse_attribute(size_t& index)
+		{
+			size_t name = index;
+			size_t name_end = scan_name(index);
+			index = name_end;
+			if (input.data()[index] != '=')
+			{
+				index = skip_space(index);
+				if (input.data()[index] != '=') return fail(status_bad_attribute, index);
+			}
+			++index;
+			char_t quote = input.data()[index];
+			if (quote != '"' && quote != '\'')
+			{
+				index = skip_space(index);
+				quote = input.data()[index];
+				if (quote != '"' && quote != '\'') return fail(status_bad_attribute, index);
+			}
+
+			size_t value = index + 1;
+			size_t convert_from = value;
+			if (!(options & parse_wnorm_attribute))
+			{
+				char_t* data = input.data();
+				char_t* s = data + value;
+				unsigned int special = (options & parse_wconv_attribute) ? ct_parse_attr_ws : ct_parse_attr;
+				PUGI_IMPL_SCANWHILE_UNROLL(!PUGI_IMPL_IS_CHARTYPE(ss, special));
+				convert_from = static_cast<size_t>(s - data);
+			}
+			size_t value_end = input.data()[convert_from] == quote ? convert_from : scan_char(convert_from, quote);
+			if (input.data()[value_end] != quote) return fail(status_bad_attribute, value);
+			index = value_end + 1;
+			if (PUGI_IMPL_IS_CHARTYPE(input.peek(index), ct_start_symbol)) return fail(status_bad_attribute, index);
+
+			char_t* data = input.data();
+			if constexpr (!Events::sized) data[name_end] = 0;
+			if (convert_from == value_end)
+			{
+				if constexpr (!Events::sized) data[value_end] = 0;
+			}
+			else
+				convert_attribute(data + convert_from, quote);
+
+			if (!offsets.reserve(attribute_count + 1, attribute_count)) return fail(status_out_of_memory, name);
+			auto& attribute = offsets.data[attribute_count];
+			attribute.name = name;
+			attribute.value = value;
+			if constexpr (Events::sized)
+			{
+				attribute.name_length = name_end - name;
+				attribute.value_length = (convert_from == value_end) ? value_end - value : convert_from - value + strlength(data + convert_from);
+			}
+			++attribute_count;
+			return true;
+		}
+
+		size_t space_prefix() const
+		{
+			const char_t* s = input.data();
+			PUGI_IMPL_SKIPWS();
+			return static_cast<size_t>(s - input.data());
+		}
+
+		char_t discard_space()
+		{
+			for (;;)
+			{
+				size_t length = space_prefix();
+				input.consume(length);
+				if (input.available() || !input.more()) return input.data()[0];
+			}
+		}
+
+		bool chunk(xml_node_type type, const char_t* data, size_t length = static_cast<size_t>(-1))
+		{
+			if (type == node_null) return event(handler.attribute_value(data, length));
+
+			stack.mark_child();
+			return event(handler.text(type, data, length));
+		}
+
+		bool flush_space(xml_node_type type, sax_pending_space& space)
+		{
+			char_t buffer[4097];
+			while (!space.empty())
+			{
+				size_t count = space.take(buffer, 4096);
+				if constexpr (!Events::sized) buffer[count] = 0;
+				if (!chunk(type, buffer, count)) return false;
+			}
+			return true;
+		}
+
+		bool emit_trimmed(xml_node_type type, sax_pending_space& space, char_t* data, char_t* end, bool final, bool& visible, bool* emitted)
+		{
+			char_t* zero = sax_find(data, 0);
+			visible = zero == end;
+			char_t* split = zero;
+			if (visible)
+				while (split != data && PUGI_IMPL_IS_CHARTYPE(split[-1], ct_space)) --split;
+
+			// A decoded NUL is a non-whitespace character for trimming, but the
+			// C-string callback only sees what precedes it.
+			if (split != data || !visible)
+			{
+				if (!space.empty() && !flush_space(type, space)) return false;
+				if constexpr (Events::sized)
+				{
+					if (!chunk(type, data, static_cast<size_t>(split - data))) return false;
+				}
+				else
+				{
+					char_t saved = *split;
+					*split = 0;
+					bool proceed = chunk(type, data);
+					*split = saved;
+					if (!proceed) return false;
+				}
+				if (emitted) *emitted = true;
+			}
+
+			if (!final && split != zero && !space.add(split, static_cast<size_t>(zero - split)))
+				return fail(status_out_of_memory);
+
+			return true;
+		}
+
+		bool extend_text(size_t size, unsigned int conversion)
+		{
+			char_t* data = input.data();
+			if ((conversion & parse_escapes) && size >= 2 && data[0] == '&' && data[1] == '#')
+			{
+				// Scan each block once, even for an unusually long reference.
+				bool hex = input.peek(2) == 'x';
+				size_t index = hex && size == 2 ? 3 : size;
+				while (sax_reference_digit(input.peek(index), hex)) ++index;
+			}
+			else input.more();
+
+			return input.status == status_ok;
+		}
+
+		char_t* convert_attribute_chunk(char_t* data, size_t length, bool escapes, bool& seen, bool& in_space)
+		{
+			const bool trim = (options & parse_wnorm_attribute) != 0;
+			const bool convert_space = (options & parse_wconv_attribute) != 0;
+			const bool normalize_eol = (options & parse_eol) != 0;
+			const unsigned int special = trim ? ct_parse_attr_ws | ct_space : convert_space ? ct_parse_attr_ws : ct_parse_attr;
+
+			if (length >= 256 && !trim && !escapes &&
+				(!(convert_space || normalize_eol) || !sax_contains(data, length, '\r')) &&
+				(!convert_space || (!sax_contains(data, length, '\n') && !sax_contains(data, length, '\t'))))
+				return data + length;
+
+			gap g;
+			char_t* s = data;
+			char_t* end = data + length;
+			while (s != end)
+			{
+				char_t* ordinary = s;
+				PUGI_IMPL_SCANWHILE_UNROLL(!PUGI_IMPL_IS_CHARTYPE(ss, special));
+				if (s != ordinary)
+				{
+					seen = true;
+					in_space = false;
+				}
+				if (s == end) break;
+
+				if (trim && PUGI_IMPL_IS_CHARTYPE(*s, ct_space))
+				{
+					if (!seen || in_space) g.push(s, 1);
+					else *s++ = ' ';
+					in_space = true;
+				}
+				else
+				{
+					seen = true;
+					in_space = false;
+					if (*s == '&' && escapes)
+						s = strconv_escape(s, g);
+					else if (convert_space && PUGI_IMPL_IS_CHARTYPE(*s, ct_space))
+					{
+						char_t original = *s;
+						*s++ = ' ';
+						if (original == '\r' && *s == '\n') g.push(s, 1);
+					}
+					else if (*s == '\r' && normalize_eol)
+					{
+						*s++ = '\n';
+						if (*s == '\n') g.push(s, 1);
+					}
+					else ++s;
+				}
+			}
+
+			end = g.flush(s);
+			*end = 0;
+			return end;
+		}
+
+		bool stream_attribute()
+		{
+			size_t name_end = scan_name(0);
+			char_t* data = input.data();
+			char_t saved = data[name_end];
+			if constexpr (!Events::sized) data[name_end] = 0;
+			bool proceed = handler.start_attribute(data, name_end);
+			if constexpr (!Events::sized) data[name_end] = saved;
+			if (!event(proceed)) return false;
+
+			input.consume(name_end);
+			if (discard_space() != '=') return fail(status_bad_attribute);
+			input.consume(1);
+			char_t quote = discard_space();
+			if (quote != '"' && quote != '\'') return fail(status_bad_attribute);
+			input.consume(1);
+
+			sax_pending_space pending;
+			bool visible = true, seen = false, in_space = false;
+			const bool trim = (options & parse_wnorm_attribute) != 0;
+			unsigned int conversion = options & parse_escapes;
+			if (!trim && (options & (parse_eol | parse_wconv_attribute))) conversion |= parse_eol;
+
+			for (;;)
+			{
+				data = input.data();
+				size_t size = input.available();
+				char_t* mark = sax_find(data, quote);
+				size_t length = mark ? static_cast<size_t>(mark - data) : strlength(data);
+				bool final = mark != NULL;
+				if (!final && (input.eof || length < size)) return fail(status_bad_attribute);
+
+				unsigned int block_conversion = conversion;
+				if (visible && length >= 256 && (conversion & parse_escapes) && !sax_contains(data, length, '&'))
+					block_conversion &= ~parse_escapes;
+
+				if (!final && visible)
+				{
+					length = sax_complete_text(data, length, block_conversion);
+					if (!length)
+					{
+						if (!extend_text(size, block_conversion)) return false;
+						continue;
+					}
+				}
+
+				if (length && visible)
+				{
+					saved = data[length];
+					data[length] = 0;
+					char_t* end = convert_attribute_chunk(data, length, (block_conversion & parse_escapes) != 0, seen, in_space);
+					if (trim)
+					{
+						if (!emit_trimmed(node_null, pending, data, end, final, visible, NULL)) return false;
+					}
+					else
+					{
+						if constexpr (Events::sized)
+						{
+							char_t* zero = end == data + length ? end : sax_find(data, 0);
+							if (!chunk(node_null, data, static_cast<size_t>(zero - data))) return false;
+							visible = zero == end;
+						}
+						else
+						{
+							if (!chunk(node_null, data)) return false;
+							if (end != data + length) visible = sax_find(data, 0) == end;
+						}
+					}
+					data[length] = saved;
+				}
+
+				input.consume(length);
+				if (final)
+				{
+					input.consume(1);
+					if (PUGI_IMPL_IS_CHARTYPE(input.peek(0), ct_start_symbol)) return fail(status_bad_attribute);
+					return input.status == status_ok && event(handler.sink->end_attribute());
+				}
+				if (!input.available() && !input.more()) return fail(status_bad_attribute);
+			}
+		}
+
+		bool stream_start_element()
+		{
+			size_t end = scan_name(1);
+			char_t* data = input.data();
+			char_t separator = data[end];
+			if (separator != '>' && separator != '/' && !PUGI_IMPL_IS_CHARTYPE(separator, ct_space))
+				return fail(status_bad_start_element, end);
+
+			if constexpr (!Events::sized) data[end] = 0;
+			bool pushed = stack.template push<!Events::sized>(data + 1, end - 1);
+			if constexpr (!Events::sized) data[end] = separator;
+			if (!pushed) return fail(status_out_of_memory, end);
+			if (!event(handler.start_element(stack.top(), end - 1, NULL, 0))) return false;
+
+			input.consume(end);
+			char_t ch = discard_space();
+			while (PUGI_IMPL_IS_CHARTYPE(ch, ct_start_symbol))
+			{
+				if (!stream_attribute()) return false;
+				ch = discard_space();
+			}
+
+			bool empty = ch == '/';
+			if (empty)
+			{
+				input.consume(1);
+				ch = input.peek(0);
+			}
+			if (ch != '>') return fail(status_bad_start_element);
+			input.consume(1);
+			has_element = true;
+			if (!event(handler.sink->end_start_element())) return false;
+			if (empty)
+			{
+				if (!event(handler.end_element(stack.top(), stack.length()))) return false;
+				stack.pop();
+			}
+			return true;
+		}
+
+		bool start_element()
+		{
+			size_t name_end = scan_name(1);
+			size_t index = name_end;
+			char_t end = input.data()[index];
+			attribute_count = 0;
+
+			if (PUGI_IMPL_IS_CHARTYPE(end, ct_space))
+			{
+				index = skip_space(index);
+				while (PUGI_IMPL_IS_CHARTYPE(input.data()[index], ct_start_symbol))
+				{
+					if (!parse_attribute(index)) return false;
+					index = skip_space(index);
+				}
+				end = input.data()[index];
+			}
+
+			bool empty = end == '/';
+			if (empty) end = input.peek(++index);
+			if (end != '>') return fail(status_bad_start_element, empty || index != name_end ? index : index + (end != 0));
+
+			char_t* data = input.data();
+			if constexpr (!Events::sized) data[name_end] = 0;
+			if (!attributes.reserve(attribute_count, 0)) return fail(status_out_of_memory, name_end);
+			for (size_t i = 0; i < attribute_count; ++i)
+			{
+				const auto& entry = offsets.data[i];
+				if constexpr (Events::sized)
+					attributes.data[i] = Events::make_attribute(data + entry.name, entry.name_length, data + entry.value, entry.value_length);
+				else
+					attributes.data[i] = Events::make_attribute(data + entry.name, 0, data + entry.value, 0);
+			}
+
+			const char_t* name = data + 1;
+			if (empty)
+				stack.mark_child();
+			else if (!stack.template push<!Events::sized>(name, name_end - 1))
+				return fail(status_out_of_memory, name_end);
+
+			has_element = true;
+			if (!event(handler.start_element(name, name_end - 1, attributes.data, attribute_count))) return false;
+			if (empty && !event(handler.end_element(name, name_end - 1))) return false;
+
+			input.consume(index + 1);
+			return true;
+		}
+
+		bool end_element()
+		{
+			if (!stack.size) return fail(status_end_element_mismatch, 2);
+
+			const char_t* name = stack.top();
+			size_t length = stack.length();
+			size_t index = length + 2;
+			const char_t* data = input.data();
+
+			if (index >= input.available() || data[index] != '>' || memcmp(data + 2, name, length * sizeof(char_t)) != 0)
+			{
+				index = scan_name(2);
+				if (index - 2 != length || memcmp(input.data() + 2, name, length * sizeof(char_t)) != 0)
+					return fail(status_end_element_mismatch, 2);
+
+				index = skip_space(index);
+				if (input.data()[index] != '>') return fail(status_bad_end_element, index);
+			}
+			if (!event(handler.end_element(name, length))) return false;
+
+			stack.pop();
+			input.consume(index + 1);
+			return true;
+		}
+
+		bool scan_text_space(sax_pending_space& pending, bool& report, size_t& scanned)
+		{
+			for (;;)
+			{
+				size_t length = space_prefix();
+				char_t* data = input.data();
+				if (length < input.available() || input.eof)
+				{
+					char_t next = data[length];
+					if (next == '<' || next == 0)
+					{
+						if ((options & parse_trim_pcdata) || !(options & (parse_ws_pcdata | parse_ws_pcdata_single)))
+							report = false;
+						else if (options & parse_ws_pcdata_single)
+							report = next == '<' && input.peek(length + 1) == '/' && !stack.has_child();
+					}
+					if (!report || (options & parse_trim_pcdata)) input.consume(length);
+					else scanned = length;
+					return input.status == status_ok;
+				}
+
+				if (!(options & parse_trim_pcdata))
+				{
+					if ((options & parse_eol) && length && data[length - 1] == '\r') --length;
+					if (length)
+					{
+						char_t saved = data[length];
+						data[length] = 0;
+						char_t* end = data + length;
+						if (options & parse_eol) convert_text(data, data + length, end);
+						if (!pending.add(data, static_cast<size_t>(end - data))) return fail(status_out_of_memory);
+						data[length] = saved;
+					}
+				}
+				input.consume(length);
+				input.more();
+				if (input.status != status_ok) return false;
+			}
+		}
+
+		bool pcdata()
+		{
+			bool report = stack.size || (options & parse_fragment);
+			const bool trim = (options & parse_trim_pcdata) != 0;
+			sax_pending_space pending;
+			size_t scanned = 0;
+			if (report && PUGI_IMPL_IS_CHARTYPE(*input.data(), ct_space))
+				if (!scan_text_space(pending, report, scanned)) return false;
+
+			if (!report)
+			{
+				for (;;)
+				{
+					char_t* mark = sax_find(input.data(), '<');
+					if (mark)
+					{
+						input.consume(static_cast<size_t>(mark - input.data()));
+						return true;
+					}
+
+					size_t length = strlength(input.data());
+					bool nul = length < input.available();
+					input.consume(length);
+					if (nul || !input.more()) return input.status == status_ok;
+				}
+			}
+
+			bool emitted = !pending.empty();
+			if (emitted && !flush_space(node_pcdata, pending)) return false;
+
+			bool visible = true;
+			for (;;)
+			{
+				char_t* data = input.data();
+				size_t size = input.available();
+			#if defined(PUGI_IMPL_PCDATA_NEON) || defined(PUGI_IMPL_PCDATA_SSE2)
+				unsigned int conversion = options & (parse_escapes | parse_eol);
+				char_t* convert_from = data;
+				size_t length;
+				bool mark;
+
+				if (visible && conversion && scanned == 0)
+					convert_from = scan_pcdata(data, data + size);
+
+				if (*convert_from == '<' || *convert_from == 0)
+				{
+					mark = *convert_from == '<';
+					length = static_cast<size_t>(convert_from - data);
+					conversion = 0;
+				}
+				else
+				{
+					char_t* start = convert_from == data ? data + scanned : convert_from;
+					char_t* delimiter = sax_find(start, '<');
+					mark = delimiter != NULL;
+					length = mark ? static_cast<size_t>(delimiter - data) : static_cast<size_t>(start - data) + strlength(start);
+					if (visible && length >= 256)
+					{
+						if ((conversion & parse_escapes) && !sax_contains(convert_from, length - (convert_from - data), '&')) conversion &= ~parse_escapes;
+						if ((conversion & parse_eol) && !sax_contains(convert_from, length - (convert_from - data), '\r')) conversion &= ~parse_eol;
+					}
+				}
+
+				bool last = mark || length < size || input.eof;
+			#else
+				char_t* mark = sax_find(data + scanned, '<');
+				size_t length = mark ? static_cast<size_t>(mark - data) : scanned + strlength(data + scanned);
+				bool last = mark || length < size || input.eof;
+				unsigned int conversion = options & (parse_escapes | parse_eol);
+
+				// Short values go straight to conversion. The C library can
+				// scan large unescaped runs faster than the scalar converter.
+				if (visible && length >= 256)
+				{
+					if ((conversion & parse_escapes) && !sax_contains(data, length, '&')) conversion &= ~parse_escapes;
+					if ((conversion & parse_eol) && !sax_contains(data, length, '\r')) conversion &= ~parse_eol;
+				}
+				char_t* convert_from = data;
+			#endif
+
+				if (!last && visible)
+				{
+					length = sax_complete_text(data, length, conversion);
+					if (!length)
+					{
+						if (!extend_text(size, conversion)) return false;
+						scanned = 0;
+						continue;
+					}
+				}
+
+				if (length && visible)
+				{
+					char_t saved = data[length];
+					bool terminate = !Events::sized || conversion || trim;
+					if (terminate) data[length] = 0;
+					char_t* decoded_end = data + length;
+					if (conversion && convert_from < data + length) convert_text(convert_from, data + length, decoded_end);
+
+					if (trim)
+					{
+						if (!emit_trimmed(node_pcdata, pending, data, decoded_end, last, visible, &emitted)) return false;
+					}
+					else
+					{
+						bool may_have_nul = (conversion & parse_escapes) && decoded_end != data + length;
+						if constexpr (Events::sized)
+						{
+							char_t* zero = may_have_nul ? sax_find(data, 0) : decoded_end;
+							if (!chunk(node_pcdata, data, static_cast<size_t>(zero - data))) return false;
+							visible = zero == decoded_end;
+						}
+						else
+						{
+							if (!chunk(node_pcdata, data)) return false;
+							// A numeric reference for NUL terminates a DOM value.
+							if (!last && may_have_nul) visible = sax_find(data, 0) == decoded_end;
+						}
+					}
+					if (terminate) data[length] = saved;
+				}
+
+				input.consume(length);
+				if (last)
+				{
+					if (trim && !emitted && !chunk(node_pcdata, PUGIXML_TEXT(""))) return false;
+					// The DOM text converter consumes '<' before checking for EOF.
+					if (mark && !input.peek(1)) input.consume(1);
+					return input.status == status_ok;
+				}
+
+				scanned = 0;
+				if (!input.available() && !input.more())
+				{
+					if (input.status != status_ok) return false;
+					return !trim || emitted || chunk(node_pcdata, PUGIXML_TEXT(""));
+				}
+			}
+		}
+
+		// Scan the current window, leaving index at the first possible
+		// beginning of a terminator that straddles the next read.
+		bool find_section_end(size_t& index, const char_t* terminator, size_t length)
+		{
+			char_t* data = input.data();
+
+			for (;;)
+			{
+				char_t* mark = sax_find(data + index, terminator[0]);
+				if (!mark)
+				{
+					index += strlength(data + index);
+					return false;
+				}
+
+				index = static_cast<size_t>(mark - data);
+				size_t matched = 1;
+				while (matched < length && mark[matched] == terminator[matched]) ++matched;
+				if (matched == length) return true;
+				if (index + matched == input.available()) return false;
+				++index;
+			}
+		}
+
+		size_t section_end(size_t index, const char_t* terminator, size_t length, bool discard = false)
+		{
+			while (!find_section_end(index, terminator, length))
+			{
+				if (index < input.available() && input.data()[index] == 0) return index;
+
+				if (discard)
+				{
+					input.consume(index);
+					index = 0;
+				}
+
+				if (!input.more()) return index;
+			}
+			return index;
+		}
+
+		bool comment()
+		{
+			bool report = (options & parse_comments) != 0;
+			if (report && (options & parse_sax_stream_comments))
+				return section_chunks(node_comment, 4, PUGIXML_TEXT("-->"), status_bad_comment);
+
+			size_t end = section_end(4, PUGIXML_TEXT("-->"), 3, !report);
+			if (!match(end, PUGIXML_TEXT("-->"))) return fail(status_bad_comment, report && (options & parse_eol) ? 4 : end);
+
+			if (report)
+			{
+				char_t* data = input.data();
+				if (options & parse_eol) strconv_comment(data + 4, 0);
+				else data[end] = 0;
+				stack.mark_child();
+				if (!event(handler.text(node_comment, data + 4, (options & parse_eol) ? static_cast<size_t>(-1) : end - 4))) return false;
+			}
+			input.consume(end + 3);
+			return true;
+		}
+
+		bool cdata()
+		{
+			const char_t* terminator = PUGIXML_TEXT("]]>");
+			if (!(options & parse_cdata))
+			{
+				size_t end = section_end(9, terminator, 3, true);
+				if (!match(end, terminator)) return fail(status_bad_cdata, end);
+				input.consume(end + 3);
+				return true;
+			}
+
+			return section_chunks(node_cdata, 9, terminator, status_bad_cdata);
+		}
+
+		bool section_chunks(xml_node_type type, size_t prefix, const char_t* terminator, xml_parse_status error)
+		{
+			input.consume(prefix);
+			bool emitted = false;
+			for (;;)
+			{
+				size_t end = 0;
+				bool found = find_section_end(end, terminator, 3);
+				char_t* data = input.data();
+				bool nul = end < input.available() && data[end] == 0;
+				size_t length = found ? end : sax_complete_text(data, end, options & parse_eol);
+
+				if (length || (found && (type == node_comment || !emitted)))
+				{
+					char_t saved[3];
+					memcpy(saved, data + length, sizeof(saved));
+
+					if (options & parse_eol)
+					{
+						memcpy(data + length, terminator, sizeof(saved));
+						if (type == node_cdata) strconv_cdata(data, 0);
+						else strconv_comment(data, 0);
+					}
+					else if constexpr (!Events::sized) data[length] = 0;
+
+					stack.mark_child();
+					size_t decoded_length = (options & parse_eol) ? static_cast<size_t>(-1) : length;
+					bool proceed = type == node_comment ? handler.comment_chunk(data, decoded_length, found) : handler.text(type, data, decoded_length);
+					if (!event(proceed)) return false;
+					memcpy(data + length, saved, sizeof(saved));
+					input.consume(length);
+					emitted = true;
+				}
+
+				if (found)
+				{
+					input.consume(3);
+					return true;
+				}
+				if (nul || !input.more()) return fail(error);
+			}
+		}
+
+		bool match(size_t index, const char_t* prefix)
+		{
+			for (size_t i = 0; prefix[i]; ++i)
+				if (input.peek(index + i) != prefix[i]) return false;
+			return true;
+		}
+
+		bool doctype()
+		{
+			if (stack.size) return fail(status_bad_doctype);
+
+			bool report = (options & parse_doctype) != 0;
+			size_t index = 9;
+			size_t depth = 0;
+			for (;;)
+			{
+				if (!report && index >= sax_input<Events::sized>::block_size)
+				{
+					input.consume(index);
+					index = 0;
+				}
+				char_t ch = input.peek(index);
+				if (!ch) return fail(status_bad_doctype, index);
+				if (ch == '>' && depth == 0) break;
+				if (ch == '>')
+				{
+					--depth;
+					++index;
+				}
+				else if (ch == '"' || ch == '\'')
+				{
+					index = section_end(index + 1, &ch, 1, !report);
+					if (input.peek(index) != ch) return fail(status_bad_doctype, index);
+					++index;
+				}
+				else if (ch == '<')
+				{
+					if (match(index, PUGIXML_TEXT("<!--")))
+					{
+						index = section_end(index + 4, PUGIXML_TEXT("-->"), 3, !report);
+						if (!match(index, PUGIXML_TEXT("-->"))) return fail(status_bad_doctype, index);
+						index += 3;
+					}
+					else if (match(index, PUGIXML_TEXT("<?")))
+					{
+						index = section_end(index + 2, PUGIXML_TEXT("?>"), 2, !report);
+						if (!match(index, PUGIXML_TEXT("?>"))) return fail(status_bad_doctype, index);
+						index += 2;
+					}
+					else if (match(index, PUGIXML_TEXT("<![")))
+					{
+						index += 3;
+						size_t nesting = 1;
+						while (nesting)
+						{
+							if (!report && index >= sax_input<Events::sized>::block_size)
+							{
+								input.consume(index);
+								index = 0;
+							}
+							char_t item = input.peek(index);
+							if (!item) return fail(status_bad_doctype, index);
+							if (item == '<' && match(index, PUGIXML_TEXT("<!["))) { ++nesting; index += 3; }
+							else if (item == ']' && match(index, PUGIXML_TEXT("]]>"))) { --nesting; index += 3; }
+							else ++index;
+						}
+					}
+					else if (match(index, PUGIXML_TEXT("<!")) && input.peek(index + 2) != '-')
+					{
+						++depth;
+						index += 2;
+					}
+					else return fail(status_bad_doctype, index);
+				}
+				else ++index;
+			}
+
+			if (report)
+			{
+				char_t* data = input.data();
+				data[index] = 0;
+				char_t* s = data + 9;
+				PUGI_IMPL_SKIPWS();
+				if (!event(handler.text(node_doctype, s, static_cast<size_t>(data + index - s)))) return false;
+			}
+			input.consume(index + 1);
+			return true;
+		}
+
+		bool question()
+		{
+			if (!PUGI_IMPL_IS_CHARTYPE(input.peek(2), ct_start_symbol)) return fail(status_bad_pi, 2);
+			size_t target_end = scan_name(2);
+			const char_t* target = input.data() + 2;
+			bool declaration = target_end == 5 && (target[0] | ' ') == 'x' && (target[1] | ' ') == 'm' && (target[2] | ' ') == 'l';
+			unsigned int flag = declaration ? parse_declaration : parse_pi;
+
+			if ((options & flag) && declaration && stack.size) return fail(status_bad_pi, target_end);
+
+			size_t end = section_end(target_end, PUGIXML_TEXT("?>"), 2, !(options & flag));
+			if (!match(end, PUGIXML_TEXT("?>"))) return fail(status_bad_pi, end);
+			end += 2;
+
+			if (options & flag)
+			{
+				// Parse the isolated PI/declaration with the DOM grammar, including
+				// the declaration's attribute normalization and permissive forms.
+				char_t* data = input.data();
+				char_t saved = data[end];
+				data[end] = 0;
+				xml_document token;
+				xml_parse_result result = token.load_buffer_inplace(data, (end + 1) * sizeof(char_t), options | parse_fragment, get_write_native_encoding());
+				data[end] = saved;
+				if (!result) return fail(result.status, static_cast<size_t>(result.offset));
+
+				xml_node node = token.first_child();
+				if (declaration)
+				{
+					attribute_count = 0;
+					for (xml_attribute attr = node.first_attribute(); attr; attr = attr.next_attribute())
+					{
+						if (!attributes.reserve(attribute_count + 1, attribute_count)) return fail(status_out_of_memory);
+						attributes.data[attribute_count] = Events::make_attribute(attr.name(), static_cast<size_t>(-1), attr.value(), static_cast<size_t>(-1));
+						++attribute_count;
+					}
+					if (!event(handler.declaration(node.name(), attributes.data, attribute_count))) return false;
+				}
+				else if (!event(handler.processing_instruction(node.name(), node.value()))) return false;
+				stack.mark_child();
+			}
+			input.consume(end);
+			return true;
+		}
+
+		bool tag()
+		{
+			char_t ch = input.peek(1);
+			if (PUGI_IMPL_IS_CHARTYPE(ch, ct_start_symbol))
+				return (options & parse_sax_stream_attributes) ? stream_start_element() : start_element();
+			if (ch == '/') return end_element();
+			if (ch == '?') return question();
+			if (ch != '!') return fail(status_unrecognized_tag, 1);
+
+			ch = input.peek(2);
+			if (ch == '-')
+			{
+				if (input.peek(3) != '-') return fail(status_bad_comment, 3);
+				return comment();
+			}
+			if (ch == '[')
+			{
+				const char_t* prefix = PUGIXML_TEXT("CDATA[");
+				for (size_t i = 0; prefix[i]; ++i)
+					if (input.peek(3 + i) != prefix[i]) return fail(status_bad_cdata, 3 + i);
+				return cdata();
+			}
+			if (match(2, PUGIXML_TEXT("DOCTYPE"))) return doctype();
+			return fail(status_unrecognized_tag, 2);
+		}
+
+		// Borrow complete, untransformed tokens from native memory. The window
+		// parser resumes at the same byte whenever a token needs its full grammar.
+		void parse_direct(sax_memory_reader& memory)
+		{
+			const char_t* end = reinterpret_cast<const char_t*>(memory.data + memory.remaining);
+			while (memory.remaining && *memory.data && input.status == status_ok)
+			{
+				const char_t* begin = reinterpret_cast<const char_t*>(memory.data);
+				const char_t* next = *begin == '<' ? direct_tag(begin, end) : direct_text(begin, end);
+				if (!next) break;
+
+				size_t length = static_cast<size_t>(next - begin);
+				memory.consume(length);
+				input.offset += length;
+			}
+		}
+
+		const char_t* direct_text(const char_t* begin, const char_t* end)
+		{
+			const char_t* text = begin;
+			while (text != end && PUGI_IMPL_IS_CHARTYPE(*text, ct_space)) ++text;
+			if (text == end || *text == '<' || *text == 0) return text;
+			if (!stack.size) return NULL;
+
+			// Reported text includes its leading whitespace, which can need CR normalization.
+			const char_t* mark = begin;
+		#if defined(PUGI_IMPL_PCDATA_NEON) || defined(PUGI_IMPL_PCDATA_SSE2)
+			mark = scan_pcdata_blocks<false>(mark, end);
+		#endif
+			while (mark != end && !PUGI_IMPL_IS_CHARTYPE(*mark, ct_parse_pcdata)) ++mark;
+			if (mark != end && *mark != '<' && *mark != 0) return NULL;
+			if (mark != end && *mark == '<' && (mark + 1 == end || mark[1] == 0)) return NULL;
+
+			return chunk(node_pcdata, begin, static_cast<size_t>(mark - begin)) ? mark : NULL;
+		}
+
+		const char_t* direct_tag(const char_t* begin, const char_t* end)
+		{
+			const char_t* name = begin + 1;
+			if (name == end) return NULL;
+			if (*name == '/')
+			{
+				if (!stack.size) return NULL;
+				const char_t* close = name + 1;
+				size_t length = stack.length();
+				if (static_cast<size_t>(end - close) <= length || close[length] != '>' || memcmp(close, stack.top(), length * sizeof(char_t)) != 0) return NULL;
+
+				if (!event(handler.end_element(stack.top(), length))) return NULL;
+				stack.pop();
+				return close + length + 1;
+			}
+			if (!PUGI_IMPL_IS_CHARTYPE(*name, ct_start_symbol)) return NULL;
+
+			const char_t* cursor = name + 1;
+			while (cursor != end && PUGI_IMPL_IS_CHARTYPE(*cursor, ct_symbol)) ++cursor;
+			size_t length = static_cast<size_t>(cursor - name);
+			attribute_count = 0;
+			if (cursor != end && PUGI_IMPL_IS_CHARTYPE(*cursor, ct_space))
+			{
+				do
+				{
+					while (cursor != end && PUGI_IMPL_IS_CHARTYPE(*cursor, ct_space)) ++cursor;
+					if (cursor == end || !PUGI_IMPL_IS_CHARTYPE(*cursor, ct_start_symbol)) break;
+					cursor = direct_attribute(cursor, end);
+					if (!cursor) return NULL;
+				}
+				while (cursor != end && PUGI_IMPL_IS_CHARTYPE(*cursor, ct_space));
+			}
+
+			bool empty = cursor != end && *cursor == '/';
+			if (empty) ++cursor;
+			if (cursor == end || *cursor != '>') return NULL;
+
+			if (empty)
+				stack.mark_child();
+			else if (!stack.borrow(name, length))
+			{
+				fail(status_out_of_memory, static_cast<size_t>(name - begin) + length);
+				return NULL;
+			}
+
+			has_element = true;
+			if (!event(handler.start_element(name, length, attributes.data, attribute_count))) return NULL;
+			if (empty && !event(handler.end_element(name, length))) return NULL;
+			return cursor + 1;
+		}
+
+		const char_t* direct_attribute(const char_t* name, const char_t* end)
+		{
+			const char_t* cursor = name + 1;
+			while (cursor != end && PUGI_IMPL_IS_CHARTYPE(*cursor, ct_symbol)) ++cursor;
+			size_t name_length = static_cast<size_t>(cursor - name);
+			while (cursor != end && PUGI_IMPL_IS_CHARTYPE(*cursor, ct_space)) ++cursor;
+			if (cursor == end || *cursor++ != '=') return NULL;
+			while (cursor != end && PUGI_IMPL_IS_CHARTYPE(*cursor, ct_space)) ++cursor;
+			if (cursor == end || (*cursor != '"' && *cursor != '\'')) return NULL;
+			char_t quote = *cursor++;
+
+			const char_t* value = cursor;
+			while (cursor != end && !PUGI_IMPL_IS_CHARTYPE(*cursor, ct_parse_attr_ws)) ++cursor;
+			if (cursor == end || *cursor != quote) return NULL;
+			if (cursor + 1 != end && PUGI_IMPL_IS_CHARTYPE(cursor[1], ct_start_symbol)) return NULL;
+
+			if (!attributes.reserve(attribute_count + 1, attribute_count)) return NULL;
+			attributes.data[attribute_count++] = Events::make_attribute(name, name_length, value, static_cast<size_t>(cursor - value));
+			return cursor + 1;
+		}
+
+		xml_parse_result parse(xml_encoding encoding, sax_memory_reader* memory = NULL)
+		{
+			bool initialized = false;
+			sax_memory_reader* direct = NULL;
+			if constexpr (Events::sized && sizeof(char_t) == 1)
+			{
+				if (memory && options == parse_default && get_buffer_encoding(encoding, memory->data, memory->remaining) == encoding_utf8)
+				{
+					input.encoding = encoding_utf8;
+					input.use_blocks = memory->remaining >= sax_input<Events::sized>::initial_size;
+					input.terminate();
+					if (memory->remaining >= 3 && memcmp(memory->data, "\xef\xbb\xbf", 3) == 0)
+					{
+						memory->consume(3);
+						input.offset = 3;
+					}
+					initialized = true;
+					direct = memory;
+				}
+			}
+			if constexpr (sizeof(char_t) == 1)
+				if (!initialized && memory) initialized = input.initialize_memory(encoding, *memory);
+
+			if (initialized || input.initialize(encoding))
+			{
+				for (;;)
+				{
+					if constexpr (Events::sized && sizeof(char_t) == 1)
+						if (direct && !input.available())
+						{
+							if (!direct->remaining) break;
+							parse_direct(*direct);
+							if (input.status != status_ok || !direct->remaining || !*direct->data) break;
+						}
+
+					if (!input.peek(0) || !(input.data()[0] == '<' ? tag() : pcdata())) break;
+				}
+
+				if (input.status == status_ok)
+				{
+					if (stack.size) input.status = status_end_element_mismatch;
+					else if (!(options & parse_fragment) && !has_element) input.status = status_no_document_element;
+				}
+			}
+
+			xml_parse_result result = make_parse_result(input.status, input.status == status_ok ? 0 : static_cast<ptrdiff_t>(input.offset));
+			result.encoding = input.encoding;
+			return result;
+		}
+	};
+
+	struct sax_file_reader: xml_reader
+	{
+		FILE* file;
+		explicit sax_file_reader(FILE* file_): file(file_) {}
+
+		virtual size_t read(void* data, size_t size)
+		{
+			size_t result = fread(data, 1, size, file);
+			return ferror(file) ? read_error : result;
+		}
+	};
+
+
+#ifndef PUGIXML_NO_STL
+	template <typename T> struct sax_stream_reader: xml_reader
+	{
+		std::basic_istream<T>& stream;
+		explicit sax_stream_reader(std::basic_istream<T>& stream_): stream(stream_) {}
+
+		virtual size_t read(void* buffer, size_t size)
+		{
+			if (stream.bad() || (stream.fail() && !stream.eof())) return read_error;
+			if (stream.eof()) return 0;
+
+			stream.read(static_cast<T*>(buffer), static_cast<std::streamsize>(size / sizeof(T)));
+			return stream.bad() || (stream.fail() && !stream.eof()) ? read_error : static_cast<size_t>(stream.gcount()) * sizeof(T);
+		}
+	};
+#endif
+
+	template <typename Handler> PUGI_IMPL_FN xml_parse_result sax_parse_file(FILE* file, Handler& handler, unsigned int options, xml_encoding encoding)
+	{
+		if (!file) return make_parse_result(status_file_not_found);
+
+		auto_deleter<FILE> guard(file, close_file);
+		sax_file_reader reader(file);
+		return xml_sax_parse(reader, handler, options, encoding);
+	}
+
+#ifdef PUGIXML_HAS_STRING_VIEW
+	struct sax_parser_workspace
+	{
+		sax_parser<sax_view_events> parser;
+		size_t max_retained_bytes;
+		bool busy;
+
+		explicit sax_parser_workspace(size_t budget): parser(NULL, {NULL}, parse_default), max_retained_bytes(budget), busy(false) {}
+
+		xml_parse_result parse(xml_reader& reader, xml_sax_view_handler& handler, unsigned int options, xml_encoding encoding, sax_memory_reader* memory = NULL)
+		{
+			if (busy) return make_parse_result(status_sax_aborted);
+			busy = true;
+			struct finish_scope
+			{
+				sax_parser_workspace& workspace;
+				~finish_scope()
+				{
+					workspace.parser.trim(workspace.max_retained_bytes);
+					workspace.busy = false;
+				}
+			} finish{*this};
+
+			parser.reset(reader, {&handler}, options);
+			return parser.parse(encoding, memory);
+		}
+	};
+#endif
+
+	struct sax_writer: xml_writer
+	{
+		xml_writer& sink;
+		xml_buffered_writer output;
+		sax_stack<false> stack;
+		unsigned int flags;
+		bool pending;
+		bool finished;
+		bool writing;
+
+		sax_writer(xml_writer& writer, unsigned int flags_, xml_encoding encoding):
+			sink(writer), output(*this, encoding), flags(flags_), pending(false), finished(false), writing(false)
+		{
+			if ((flags & format_write_bom) && output.encoding != encoding_latin1)
+			{
+			#ifdef PUGIXML_WCHAR_MODE
+				output.write(static_cast<wchar_t>(0xfeff));
+			#else
+				output.write('\xef', '\xbb', '\xbf');
+			#endif
+			}
+		}
+
+		virtual void write(const void* data, size_t size)
+		{
+			// A throwing sink may have consumed part of this buffer. Reject
+			// further operations so they cannot retry an ambiguous write.
+			writing = true;
+			sink.write(data, size);
+			writing = false;
+		}
+
+		void close_start()
+		{
+			if (pending)
+			{
+				output.write('>');
+				pending = false;
+			}
+		}
+
+		static bool valid_attributes(const xml_sax_attribute* attributes, size_t count)
+		{
+			if (count && !attributes) return false;
+
+			for (size_t i = 0; i < count; ++i)
+				if (!attributes[i].name || !*attributes[i].name || !attributes[i].value) return false;
+			return true;
+		}
+
+		void write_attributes(const xml_sax_attribute* attributes, size_t count)
+		{
+			char_t quote = (flags & format_attribute_single_quote) ? '\'' : '"';
+
+			for (size_t i = 0; i < count; ++i)
+			{
+				output.write_attribute_start(attributes[i].name, quote);
+				text_output(output, attributes[i].value, ctx_special_attr, flags);
+				output.write(quote);
+			}
+		}
+	#ifdef PUGIXML_HAS_STRING_VIEW
+		static bool valid_attributes(std::span<const xml_sax_attribute_view> attributes)
+		{
+			for (const auto& attribute: attributes)
+				if (attribute.name.empty()) return false;
+			return true;
+		}
+
+		void write_attributes(std::span<const xml_sax_attribute_view> attributes)
+		{
+			char_t quote = (flags & format_attribute_single_quote) ? '\'' : '"';
+			for (const auto& attribute: attributes)
+			{
+				output.write_attribute_start(attribute.name, quote);
+				text_output_view(output, attribute.value, ctx_special_attr, flags);
+				output.write(quote);
+			}
+		}
+	#endif
+
+	};
+
 	struct name_null_sentry
 	{
 		xml_node_struct* node;
@@ -5247,6 +7698,361 @@ PUGI_IMPL_NS_END
 
 namespace pugi
 {
+	PUGI_IMPL_FN xml_reader::~xml_reader() {}
+	PUGI_IMPL_FN xml_sax_handler::~xml_sax_handler() {}
+	PUGI_IMPL_FN bool xml_sax_handler::start_element(const char_t*, const xml_sax_attribute*, size_t) { return true; }
+	PUGI_IMPL_FN bool xml_sax_handler::end_element(const char_t*) { return true; }
+	PUGI_IMPL_FN bool xml_sax_handler::text(xml_node_type, const char_t*) { return true; }
+	PUGI_IMPL_FN bool xml_sax_handler::processing_instruction(const char_t*, const char_t*) { return true; }
+	PUGI_IMPL_FN bool xml_sax_handler::declaration(const char_t*, const xml_sax_attribute*, size_t) { return true; }
+	PUGI_IMPL_FN bool xml_sax_handler::start_attribute(const char_t*) { return true; }
+	PUGI_IMPL_FN bool xml_sax_handler::attribute_value(const char_t*) { return true; }
+	PUGI_IMPL_FN bool xml_sax_handler::end_attribute() { return true; }
+	PUGI_IMPL_FN bool xml_sax_handler::end_start_element() { return true; }
+	PUGI_IMPL_FN bool xml_sax_handler::comment_chunk(const char_t*, bool) { return true; }
+
+	PUGI_IMPL_FN xml_parse_result xml_sax_parse(xml_reader& reader, xml_sax_handler& handler, unsigned int options, xml_encoding encoding)
+	{
+		impl::sax_parser<impl::sax_cstring_events> parser(&reader, {&handler}, options);
+		return parser.parse(encoding);
+	}
+
+	PUGI_IMPL_FN xml_parse_result xml_sax_parse_buffer(const void* data, size_t size, xml_sax_handler& handler, unsigned int options, xml_encoding encoding)
+	{
+		if (!data && size) return impl::make_parse_result(status_io_error);
+
+		impl::sax_memory_reader reader(data, size);
+		impl::sax_parser<impl::sax_cstring_events> parser(&reader, {&handler}, options);
+		return parser.parse(encoding, &reader);
+	}
+
+	PUGI_IMPL_FN xml_parse_result xml_sax_parse_file(const char* path, xml_sax_handler& handler, unsigned int options, xml_encoding encoding)
+	{
+		return impl::sax_parse_file(impl::open_file(path, "rb"), handler, options, encoding);
+	}
+
+	PUGI_IMPL_FN xml_parse_result xml_sax_parse_file(const wchar_t* path, xml_sax_handler& handler, unsigned int options, xml_encoding encoding)
+	{
+		return impl::sax_parse_file(impl::open_file_wide(path, L"rb"), handler, options, encoding);
+	}
+
+#ifndef PUGIXML_NO_STL
+	PUGI_IMPL_FN xml_parse_result xml_sax_parse(std::basic_istream<char>& stream, xml_sax_handler& handler, unsigned int options, xml_encoding encoding)
+	{
+		impl::sax_stream_reader<char> reader(stream);
+		return xml_sax_parse(reader, handler, options, encoding);
+	}
+
+	PUGI_IMPL_FN xml_parse_result xml_sax_parse(std::basic_istream<wchar_t>& stream, xml_sax_handler& handler, unsigned int options)
+	{
+		impl::sax_stream_reader<wchar_t> reader(stream);
+		return xml_sax_parse(reader, handler, options, encoding_wchar);
+	}
+#endif
+
+#ifdef PUGIXML_HAS_STRING_VIEW
+	PUGI_IMPL_FN xml_sax_view_handler::~xml_sax_view_handler() {}
+	PUGI_IMPL_FN bool xml_sax_view_handler::start_element(string_view_t, std::span<const xml_sax_attribute_view>) { return true; }
+	PUGI_IMPL_FN bool xml_sax_view_handler::end_element(string_view_t) { return true; }
+	PUGI_IMPL_FN bool xml_sax_view_handler::text(xml_node_type, string_view_t) { return true; }
+	PUGI_IMPL_FN bool xml_sax_view_handler::processing_instruction(string_view_t, string_view_t) { return true; }
+	PUGI_IMPL_FN bool xml_sax_view_handler::declaration(string_view_t, std::span<const xml_sax_attribute_view>) { return true; }
+	PUGI_IMPL_FN bool xml_sax_view_handler::start_attribute(string_view_t) { return true; }
+	PUGI_IMPL_FN bool xml_sax_view_handler::attribute_value(string_view_t) { return true; }
+	PUGI_IMPL_FN bool xml_sax_view_handler::end_attribute() { return true; }
+	PUGI_IMPL_FN bool xml_sax_view_handler::end_start_element() { return true; }
+	PUGI_IMPL_FN bool xml_sax_view_handler::comment_chunk(string_view_t, bool) { return true; }
+
+	PUGI_IMPL_FN xml_parse_result xml_sax_parse(xml_reader& reader, xml_sax_view_handler& handler, unsigned int options, xml_encoding encoding)
+	{
+		impl::sax_parser<impl::sax_view_events> parser(&reader, {&handler}, options);
+		return parser.parse(encoding);
+	}
+
+	PUGI_IMPL_FN xml_parse_result xml_sax_parse_buffer(const void* data, size_t size, xml_sax_view_handler& handler, unsigned int options, xml_encoding encoding)
+	{
+		if (!data && size) return impl::make_parse_result(status_io_error);
+
+		impl::sax_memory_reader reader(data, size);
+		impl::sax_parser<impl::sax_view_events> parser(&reader, {&handler}, options);
+		return parser.parse(encoding, &reader);
+	}
+
+	PUGI_IMPL_FN xml_parse_result xml_sax_parse_file(const char* path, xml_sax_view_handler& handler, unsigned int options, xml_encoding encoding)
+	{
+		return impl::sax_parse_file(impl::open_file(path, "rb"), handler, options, encoding);
+	}
+
+	PUGI_IMPL_FN xml_parse_result xml_sax_parse_file(const wchar_t* path, xml_sax_view_handler& handler, unsigned int options, xml_encoding encoding)
+	{
+		return impl::sax_parse_file(impl::open_file_wide(path, L"rb"), handler, options, encoding);
+	}
+
+	PUGI_IMPL_FN xml_parse_result xml_sax_parse(std::basic_istream<char>& stream, xml_sax_view_handler& handler, unsigned int options, xml_encoding encoding)
+	{
+		impl::sax_stream_reader<char> reader(stream);
+		return xml_sax_parse(reader, handler, options, encoding);
+	}
+
+	PUGI_IMPL_FN xml_parse_result xml_sax_parse(std::basic_istream<wchar_t>& stream, xml_sax_view_handler& handler, unsigned int options)
+	{
+		impl::sax_stream_reader<wchar_t> reader(stream);
+		return xml_sax_parse(reader, handler, options, encoding_wchar);
+	}
+
+	PUGI_IMPL_FN xml_sax_parser::xml_sax_parser(size_t max_retained_bytes):
+		_impl(impl::xml_memory::allocate(sizeof(impl::sax_parser_workspace)))
+	{
+		if (_impl) new (_impl) impl::sax_parser_workspace(max_retained_bytes);
+	}
+
+	PUGI_IMPL_FN xml_sax_parser::~xml_sax_parser()
+	{
+		if (!_impl) return;
+
+		static_cast<impl::sax_parser_workspace*>(_impl)->~sax_parser_workspace();
+		impl::xml_memory::deallocate(_impl);
+	}
+
+	PUGI_IMPL_FN xml_parse_result xml_sax_parser::parse(xml_reader& reader, xml_sax_view_handler& handler, unsigned int options, xml_encoding encoding)
+	{
+		if (!_impl) return impl::make_parse_result(status_out_of_memory);
+		return static_cast<impl::sax_parser_workspace*>(_impl)->parse(reader, handler, options, encoding);
+	}
+
+	PUGI_IMPL_FN xml_parse_result xml_sax_parser::parse_buffer(const void* data, size_t size, xml_sax_view_handler& handler, unsigned int options, xml_encoding encoding)
+	{
+		if (!data && size) return impl::make_parse_result(status_io_error);
+		if (!_impl) return impl::make_parse_result(status_out_of_memory);
+
+		impl::sax_memory_reader reader(data, size);
+		return static_cast<impl::sax_parser_workspace*>(_impl)->parse(reader, handler, options, encoding, &reader);
+	}
+#endif
+
+	PUGI_IMPL_FN xml_sax_writer::xml_sax_writer(xml_writer& writer, unsigned int flags, xml_encoding encoding):
+		_impl(impl::xml_memory::allocate(sizeof(impl::sax_writer)))
+	{
+		if (_impl) new (_impl) impl::sax_writer(writer, flags, encoding);
+	}
+
+	PUGI_IMPL_FN xml_sax_writer::~xml_sax_writer()
+	{
+		if (!_impl) return;
+
+		static_cast<impl::sax_writer*>(_impl)->~sax_writer();
+		impl::xml_memory::deallocate(_impl);
+	}
+
+	PUGI_IMPL_FN bool xml_sax_writer::start_element(const char_t* name, const xml_sax_attribute* attributes, size_t count)
+	{
+		impl::sax_writer* out = static_cast<impl::sax_writer*>(_impl);
+		if (!out || out->writing || out->finished || !name || !*name || !out->valid_attributes(attributes, count)) return false;
+		size_t length = impl::strlength(name);
+		if (!out->stack.push(name, length)) return false;
+
+		out->close_start();
+		out->output.write_tag_name<false>(name, length);
+		out->write_attributes(attributes, count);
+		out->pending = true;
+		return true;
+	}
+
+	PUGI_IMPL_FN bool xml_sax_writer::end_element()
+	{
+		impl::sax_writer* out = static_cast<impl::sax_writer*>(_impl);
+		if (!out || out->writing || !out->stack.size) return false;
+
+		if (out->pending && !(out->flags & format_no_empty_element_tags))
+		{
+			out->output.write('/', '>');
+			out->pending = false;
+		}
+		else
+		{
+			out->close_start();
+			out->output.write_tag_name<true>(out->stack.top(), out->stack.length());
+		}
+
+		out->stack.pop();
+		return true;
+	}
+
+	PUGI_IMPL_FN bool xml_sax_writer::text(xml_node_type type, const char_t* value)
+	{
+		impl::sax_writer* out = static_cast<impl::sax_writer*>(_impl);
+		if (!out || out->writing || out->finished || !value) return false;
+
+		switch (type)
+		{
+		case node_pcdata:
+			if (!*value) return true;
+
+			out->close_start();
+			impl::text_output(out->output, value, impl::ctx_special_pcdata, out->flags);
+			return true;
+
+		case node_cdata:
+			out->close_start();
+			impl::text_output_cdata(out->output, value);
+			return true;
+
+		case node_comment:
+			out->close_start();
+			impl::node_output_comment(out->output, value);
+			return true;
+
+		case node_doctype:
+			if (out->stack.size) return false;
+
+			out->output.write_string(PUGIXML_TEXT("<!DOCTYPE "));
+			out->output.write_string(value);
+			out->output.write('>');
+			return true;
+
+		default:
+			return false;
+		}
+	}
+
+	PUGI_IMPL_FN bool xml_sax_writer::processing_instruction(const char_t* name, const char_t* value)
+	{
+		impl::sax_writer* out = static_cast<impl::sax_writer*>(_impl);
+		if (!out || out->writing || out->finished || !name || !*name || !value) return false;
+
+		out->close_start();
+		out->output.write('<', '?');
+		out->output.write_string(name);
+		if (*value)
+		{
+			out->output.write(' ');
+			impl::node_output_pi_value(out->output, value);
+		}
+		out->output.write('?', '>');
+		return true;
+	}
+
+	PUGI_IMPL_FN bool xml_sax_writer::declaration(const char_t* name, const xml_sax_attribute* attributes, size_t count)
+	{
+		impl::sax_writer* out = static_cast<impl::sax_writer*>(_impl);
+		if (!out || out->writing || out->finished || out->stack.size || !name || !*name || !out->valid_attributes(attributes, count)) return false;
+
+		out->output.write('<', '?');
+		out->output.write_string(name);
+		out->write_attributes(attributes, count);
+		out->output.write('?', '>');
+		return true;
+	}
+
+#ifdef PUGIXML_HAS_STRING_VIEW
+	PUGI_IMPL_FN bool xml_sax_writer::start_element(string_view_t name, std::span<const xml_sax_attribute_view> attributes)
+	{
+		impl::sax_writer* out = static_cast<impl::sax_writer*>(_impl);
+		if (!out || out->writing || out->finished || name.empty() || !out->valid_attributes(attributes)) return false;
+		if (!out->stack.push<false>(name.data(), name.size())) return false;
+
+		out->close_start();
+		out->output.write_tag_name<false>(name.data(), name.size());
+		out->write_attributes(attributes);
+		out->pending = true;
+		return true;
+	}
+
+	PUGI_IMPL_FN bool xml_sax_writer::text(xml_node_type type, string_view_t value)
+	{
+		impl::sax_writer* out = static_cast<impl::sax_writer*>(_impl);
+		if (!out || out->writing || out->finished) return false;
+
+		switch (type)
+		{
+		case node_pcdata:
+			if (value.empty()) return true;
+			out->close_start();
+			impl::text_output_view(out->output, value, impl::ctx_special_pcdata, out->flags);
+			return true;
+
+		case node_cdata:
+			out->close_start();
+			impl::text_output_cdata_view(out->output, value);
+			return true;
+
+		case node_comment:
+			out->close_start();
+			impl::node_output_comment_view(out->output, value);
+			return true;
+
+		case node_doctype:
+			if (out->stack.size) return false;
+			out->output.write_string(PUGIXML_TEXT("<!DOCTYPE "));
+			impl::write_view(out->output, value);
+			out->output.write('>');
+			return true;
+
+		default:
+			return false;
+		}
+	}
+
+	PUGI_IMPL_FN bool xml_sax_writer::processing_instruction(string_view_t name, string_view_t value)
+	{
+		impl::sax_writer* out = static_cast<impl::sax_writer*>(_impl);
+		if (!out || out->writing || out->finished || name.empty()) return false;
+
+		out->close_start();
+		out->output.write('<', '?');
+		impl::write_view(out->output, name);
+		if (!value.empty())
+		{
+			out->output.write(' ');
+			impl::node_output_pi_view(out->output, value);
+		}
+		out->output.write('?', '>');
+		return true;
+	}
+
+	PUGI_IMPL_FN bool xml_sax_writer::declaration(string_view_t name, std::span<const xml_sax_attribute_view> attributes)
+	{
+		impl::sax_writer* out = static_cast<impl::sax_writer*>(_impl);
+		if (!out || out->writing || out->finished || out->stack.size || name.empty() || !out->valid_attributes(attributes)) return false;
+
+		out->output.write('<', '?');
+		impl::write_view(out->output, name);
+		out->write_attributes(attributes);
+		out->output.write('?', '>');
+		return true;
+	}
+#endif
+
+	PUGI_IMPL_FN bool xml_sax_writer::reset(xml_writer& writer, unsigned int flags, xml_encoding encoding, size_t max_retained_bytes)
+	{
+		impl::sax_writer* out = static_cast<impl::sax_writer*>(_impl);
+		if (!out || out->writing || !out->finished) return false;
+
+		out->stack.names.trim(max_retained_bytes);
+		out->stack.frames.trim(max_retained_bytes);
+		auto names = out->stack.names.detach();
+		auto frames = out->stack.frames.detach();
+		out->~sax_writer();
+
+		auto* replacement = new (_impl) impl::sax_writer(writer, flags, encoding);
+		replacement->stack.names.attach(names);
+		replacement->stack.frames.attach(frames);
+		return true;
+	}
+
+	PUGI_IMPL_FN bool xml_sax_writer::finish()
+	{
+		impl::sax_writer* out = static_cast<impl::sax_writer*>(_impl);
+		if (!out || out->writing || out->stack.size) return false;
+
+		if (!out->finished)
+		{
+			out->output.flush();
+			out->finished = true;
+		}
+		return true;
+	}
+
 	PUGI_IMPL_FN xml_writer::~xml_writer()
 	{
 	}
@@ -7575,6 +10381,7 @@ namespace pugi
 		case status_append_invalid_root: return "Unable to append nodes: root is not an element or document";
 
 		case status_no_document_element: return "No document element found";
+		case status_sax_aborted: return "SAX handler aborted parsing";
 
 		default: return "Unknown error";
 		}
@@ -7634,7 +10441,7 @@ namespace pugi
 	#endif
 
 		// initialize sentinel page
-		PUGI_IMPL_STATIC_ASSERT(sizeof(impl::xml_memory_page) + sizeof(impl::xml_document_struct) + page_offset <= sizeof(_memory));
+		static_assert(sizeof(impl::xml_memory_page) + sizeof(impl::xml_document_struct) + page_offset <= sizeof(_memory));
 
 		// prepare page structure
 		impl::xml_memory_page* page = impl::xml_memory_page::construct(_memory);
@@ -7870,9 +10677,94 @@ namespace pugi
 
 	PUGI_IMPL_FN xml_parse_result xml_document::load_buffer(const void* contents, size_t size, unsigned int options, xml_encoding encoding)
 	{
-		reset();
+	#ifndef PUGIXML_COMPACT
+		// A document with no input or dynamic pages already has an empty arena.
+		auto* current = static_cast<impl::xml_document_struct*>(_root);
+		if (_buffer || current->buffer || current->_root->prev)
+	#endif
+			reset();
 
 		return impl::load_buffer_impl(static_cast<impl::xml_document_struct*>(_root), _root, const_cast<void*>(contents), size, options, encoding, false, false, &_buffer);
+	}
+
+	PUGI_IMPL_FN xml_document_parser::xml_document_parser(size_t max_retained_bytes):
+		_reuse_capacity(0), _max_retained_bytes(max_retained_bytes)
+	{
+	}
+
+	PUGI_IMPL_FN void xml_document_parser::reset()
+	{
+		_document.reset();
+		_reuse_capacity = 0;
+	}
+
+	PUGI_IMPL_FN xml_parse_result xml_document_parser::load_buffer(const void* contents, size_t size, unsigned int options, xml_encoding encoding)
+	{
+		// Large inputs cannot reuse the native buffer within the budget.
+		if (!contents || !size || size >= _max_retained_bytes)
+		{
+			_reuse_capacity = 0;
+			return _document.load_buffer(contents, size, options, encoding);
+		}
+
+		xml_encoding actual = impl::get_buffer_encoding(encoding, contents, size);
+		bool native = actual == impl::get_write_native_encoding();
+		if (native && size > static_cast<size_t>(-1) - sizeof(char_t))
+		{
+			reset();
+			return impl::make_parse_result(status_out_of_memory);
+		}
+
+		size_t required = native ? (size / sizeof(char_t) + 1) * sizeof(char_t) : 0;
+		size_t capacity = required;
+		impl::auto_deleter<void> buffer(NULL, impl::xml_memory::deallocate);
+		if (native && _document._buffer && _reuse_capacity >= required && _reuse_capacity <= _max_retained_bytes)
+		{
+			buffer.data = _document._buffer;
+			capacity = _reuse_capacity;
+			_document._buffer = NULL;
+		}
+
+		size_t reusable_input = capacity <= _max_retained_bytes ? capacity : 0;
+		const size_t page_bytes = impl::xml_memory_page_size + sizeof(impl::xml_memory_page);
+		impl::xml_document_struct* doc = static_cast<impl::xml_document_struct*>(_document._root);
+		// The last dynamic page always has standard capacity. Dedicated pages
+		// for large allocations are inserted before it.
+		impl::xml_memory_page* page = doc->_root;
+		if (page->prev && _max_retained_bytes - reusable_input >= page_bytes)
+			page->prev->next = NULL;
+		else
+			page = NULL;
+
+		reset();
+		doc = static_cast<impl::xml_document_struct*>(_document._root);
+		if (page)
+		{
+			impl::xml_memory_page* sentinel = doc->_root;
+			impl::xml_memory_page::construct(page);
+			page->allocator = doc;
+			page->prev = sentinel;
+			sentinel->next = page;
+			doc->_root = page;
+			doc->_busy_size = 0;
+		}
+
+		if (!native)
+			return impl::load_buffer_impl(doc, doc, const_cast<void*>(contents), size, options, actual, false, false, &_document._buffer);
+
+		if (!buffer.data)
+		{
+			buffer.data = impl::xml_memory::allocate(required);
+			if (!buffer.data) return impl::make_parse_result(status_out_of_memory);
+		}
+
+		size_t length = required / sizeof(char_t) - 1;
+		char_t* copy = static_cast<char_t*>(buffer.data);
+		memcpy(copy, contents, length * sizeof(char_t));
+		copy[length] = 0;
+		buffer.release();
+		_reuse_capacity = reusable_input;
+		return impl::load_buffer_impl(doc, doc, copy, required, options, actual, true, true, &_document._buffer);
 	}
 
 	PUGI_IMPL_FN xml_parse_result xml_document::load_buffer_inplace(void* contents, size_t size, unsigned int options, xml_encoding encoding)
@@ -8853,11 +11745,8 @@ PUGI_IMPL_NS_BEGIN
 	PUGI_IMPL_FN double gen_nan()
 	{
 	#if defined(__STDC_IEC_559__) || ((FLT_RADIX - 0 == 2) && (FLT_MAX_EXP - 0 == 128) && (FLT_MANT_DIG - 0 == 24))
-		PUGI_IMPL_STATIC_ASSERT(sizeof(float) == sizeof(uint32_t));
-		typedef uint32_t UI; // BCC5 workaround
-		union { float f; UI i; } u;
-		u.i = 0x7fc00000;
-		return double(u.f);
+		static_assert(sizeof(float) == sizeof(uint32_t));
+		return static_cast<double>(std::bit_cast<float>(uint32_t{0x7fc00000}));
 	#else
 		// fallback
 		const volatile double zero = 0.0;
@@ -13718,9 +16607,9 @@ namespace pugi
 
 // Undefine all local macros (makes sure we're not leaking macros in header-only mode)
 #undef PUGI_IMPL_NO_INLINE
+#undef PUGI_IMPL_FORCE_INLINE
 #undef PUGI_IMPL_UNALIGNED
 #undef PUGI_IMPL_UNLIKELY
-#undef PUGI_IMPL_STATIC_ASSERT
 #undef PUGI_IMPL_DMC_VOLATILE
 #undef PUGI_IMPL_UNSIGNED_OVERFLOW
 #undef PUGI_IMPL_MSVC_CRT_VERSION
@@ -13744,6 +16633,8 @@ namespace pugi
 #undef PUGI_IMPL_SCANFOR
 #undef PUGI_IMPL_SCANWHILE
 #undef PUGI_IMPL_SCANWHILE_UNROLL
+#undef PUGI_IMPL_PCDATA_NEON
+#undef PUGI_IMPL_PCDATA_SSE2
 #undef PUGI_IMPL_ENDSEG
 #undef PUGI_IMPL_THROW_ERROR
 #undef PUGI_IMPL_CHECK_ERROR
